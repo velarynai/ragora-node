@@ -386,6 +386,28 @@ export RAGORA_API_KEY="your-api-key"
 npm run example:search
 ```
 
+### Quick Smoke Test (Before Publishing)
+
+Run a fast pre-publish validation:
+
+```bash
+npm run smoke
+```
+
+This runs:
+- Type checking
+- Build
+- `npm pack --dry-run`
+- Example checks (`example:search`, `example:chat`, `example:streaming`,
+  `example:credits`, `example:documents`, `example:collections`,
+  `example:marketplace`) when both env vars are set:
+
+```bash
+export RAGORA_API_KEY="your-api-key"
+export RAGORA_COLLECTION_ID="your-collection-id"
+npm run smoke
+```
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.

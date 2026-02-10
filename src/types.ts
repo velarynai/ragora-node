@@ -34,6 +34,46 @@ export interface SearchRequest {
   threshold?: number;
   /** Metadata filters (MongoDB-style operators: $gt, $gte, $lt, $lte, $in, $ne) */
   filters?: Record<string, unknown>;
+  /** Filter by source type (e.g., ["upload", "html", "youtube"]) */
+  sourceType?: string[];
+  /** Filter by source name */
+  sourceName?: string[];
+  /** Filter by document version tags */
+  version?: string[];
+  /** Version mode: "latest" or "all" */
+  versionMode?: string;
+  /** Filter by specific document keys */
+  documentKeys?: string[];
+  /** Filter by custom tags (OR logic) */
+  customTags?: string[];
+  /** Filter by domain (e.g., ["legal", "medical", "software_docs"]) */
+  domain?: string[];
+  /** Domain filter mode: "preferred" (boost, default) or "strict" (filter) */
+  domainFilterMode?: string;
+  /** Toggle reranker for result refinement (default: false) */
+  enableReranker?: boolean;
+  /** Knowledge graph filter for entity-based pre-filtering */
+  graphFilter?: {
+    /** Entity names to filter by (AND logic) */
+    entities?: string[];
+    /** Entity type to restrict (e.g., "PERSON", "ORG", "api_function") */
+    entityType?: string;
+  };
+  /** Temporal filter for time-based result weighting */
+  temporalFilter?: {
+    /** Point-in-time snapshot */
+    asOf?: string;
+    /** Start of time range */
+    since?: string;
+    /** End of time range */
+    until?: string;
+    /** Recency weight (0-1) */
+    recencyWeight?: number;
+    /** Decay function: "exponential" or "linear" */
+    recencyDecay?: string;
+    /** Half-life in days for decay */
+    decayHalfLife?: number;
+  };
 }
 
 export interface SearchResult {
@@ -52,8 +92,22 @@ export interface SearchResult {
 }
 
 export interface SearchResponse extends ResponseMetadata {
+  /** Response object type */
+  object?: string;
   /** Search results */
   results: SearchResult[];
+  /** Agent-native retrieval fragments */
+  fragments?: Array<Record<string, unknown>>;
+  /** Suggested citation instruction for downstream prompts */
+  systemInstruction?: string;
+  /** Cross-chunk graph context */
+  knowledgeGraph?: Record<string, unknown>;
+  /** Backward-compatible graph context alias */
+  globalGraphContext?: Record<string, unknown>;
+  /** Human-readable graph summary */
+  knowledgeGraphSummary?: string;
+  /** Graph enrichment debug metadata */
+  graphDebug?: Record<string, unknown>;
   /** Original query */
   query: string;
   /** Total matching results */
@@ -72,16 +126,41 @@ export interface ChatMessage {
 export interface ChatRequest {
   /** Collection ID or slug (single or array). Omit to use all accessible collections. */
   collectionId?: string | string[];
+  /** Product IDs to search */
+  productIds?: string[];
   /** Chat messages */
   messages: ChatMessage[];
-  /** Model to use (default: gpt-4o-mini) */
+  /** Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet") */
   model?: string;
   /** Sampling temperature (0-2) */
   temperature?: number;
   /** Maximum tokens to generate */
   maxTokens?: number;
-  /** Number of chunks to retrieve for context */
+  /** Number of chunks to retrieve for context (default: 5, max: 20) */
   topK?: number;
+  /** Filter by source type */
+  sourceType?: string[];
+  /** Filter by source name */
+  sourceName?: string[];
+  /** Filter by document version */
+  version?: string[];
+  /** Filter by custom tags */
+  customTags?: string[];
+  /** Metadata filters (MongoDB-style operators) */
+  filters?: Record<string, unknown>;
+  /** Toggle reranker for result refinement (default: false) */
+  enableReranker?: boolean;
+  /** Request metadata for analytics tracking */
+  metadata?: {
+    /** Request source: "web", "api", "discord_bot", "slack_bot" */
+    source?: string;
+    /** Bot installation ID */
+    installationId?: string;
+    /** Chat channel ID */
+    channelId?: string;
+    /** User who triggered the request */
+    requesterId?: string;
+  };
 }
 
 export interface ChatChoice {
@@ -115,7 +194,7 @@ export interface ChatResponse extends ResponseMetadata {
   choices: ChatChoice[];
   /** Token usage */
   usage?: ChatUsage;
-  /** Source documents used for RAG */
+  /** Source documents used for RAG (flattened from ragora_stats.sources) */
   sources: SearchResult[];
 }
 
@@ -124,7 +203,7 @@ export interface ChatStreamChunk {
   content: string;
   /** Why generation stopped */
   finishReason?: string;
-  /** Sources (only in final chunk) */
+  /** Sources from Ragora SSE metadata events */
   sources: SearchResult[];
 }
 
@@ -204,6 +283,8 @@ export interface UpdateCollectionRequest {
   description?: string;
   /** New slug (optional) */
   slug?: string;
+  /** MCP tool configuration (JSON) */
+  capabilityConfig?: Record<string, unknown>;
 }
 
 // --- Document Types ---
@@ -213,7 +294,7 @@ export interface Document {
   id: string;
   /** Original filename */
   filename: string;
-  /** Processing status: pending, processing, completed, failed */
+  /** Processing status: pending, uploading, processing, retrying, completed, failed, unsupported */
   status: string;
   /** MIME type */
   mimeType?: string;

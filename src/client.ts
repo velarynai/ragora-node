@@ -195,6 +195,56 @@ export class RagoraClient {
     }
   }
 
+  private static isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  private toSearchResult(raw: Record<string, unknown>): SearchResult {
+    const scoreRaw = raw.score;
+    const parsedScore =
+      typeof scoreRaw === 'number' ? scoreRaw : Number(scoreRaw ?? 0);
+
+    const metadata = RagoraClient.isRecord(raw.metadata)
+      ? raw.metadata
+      : {};
+
+    return {
+      id: String(raw.id ?? raw.chunk_id ?? ''),
+      content:
+        (typeof raw.text === 'string' ? raw.text : undefined) ??
+        (typeof raw.content === 'string' ? raw.content : ''),
+      score: Number.isFinite(parsedScore) ? parsedScore : 0,
+      metadata,
+      documentId:
+        typeof raw.document_id === 'string' ? raw.document_id : undefined,
+      collectionId:
+        typeof raw.collection_id === 'string' ? raw.collection_id : undefined,
+    };
+  }
+
+  private mapSearchResults(rawResults: unknown): SearchResult[] {
+    if (!Array.isArray(rawResults)) {
+      return [];
+    }
+
+    const results: SearchResult[] = [];
+    for (const raw of rawResults) {
+      if (!RagoraClient.isRecord(raw)) {
+        continue;
+      }
+      results.push(this.toSearchResult(raw));
+    }
+    return results;
+  }
+
+  private extractChatSources(payload: Record<string, unknown>): SearchResult[] {
+    const ragoraStats = payload.ragora_stats;
+    if (RagoraClient.isRecord(ragoraStats) && Array.isArray(ragoraStats.sources)) {
+      return this.mapSearchResults(ragoraStats.sources);
+    }
+    return this.mapSearchResults(payload.sources);
+  }
+
   // --- Search ---
 
   /**
@@ -208,35 +258,68 @@ export class RagoraClient {
       : undefined;
 
     const { data, metadata } = await this.request<{
-      results: Array<{
-        id: string;
-        text?: string;
-        content?: string;
-        score: number;
-        metadata?: Record<string, unknown>;
-        document_id?: string;
-        collection_id?: string;
-      }>;
+      object?: string;
+      results: unknown;
+      fragments?: unknown;
+      system_instruction?: string;
+      knowledge_graph?: Record<string, unknown>;
+      global_graph_context?: Record<string, unknown>;
+      knowledge_graph_summary?: string;
+      graph_debug?: Record<string, unknown>;
     }>('POST', '/v1/retrieve', {
       body: {
         ...(collectionIds && { collection_ids: collectionIds }),
         query: request.query,
         top_k: request.topK ?? 5,
-        filters: request.filters,
+        ...(request.filters && { filters: request.filters }),
+        ...(request.sourceType && { source_type: request.sourceType }),
+        ...(request.sourceName && { source_name: request.sourceName }),
+        ...(request.version && { version: request.version }),
+        ...(request.versionMode && { version_mode: request.versionMode }),
+        ...(request.documentKeys && { document_keys: request.documentKeys }),
+        ...(request.customTags && { custom_tags: request.customTags }),
+        ...(request.domain && { domain: request.domain }),
+        ...(request.domainFilterMode && { domain_filter_mode: request.domainFilterMode }),
+        ...(request.enableReranker !== undefined && { enable_reranker: request.enableReranker }),
+        ...(request.graphFilter && {
+          graph_filter: {
+            ...(request.graphFilter.entities && { entities: request.graphFilter.entities }),
+            ...(request.graphFilter.entityType && { entity_type: request.graphFilter.entityType }),
+          },
+        }),
+        ...(request.temporalFilter && {
+          temporal_filter: {
+            ...(request.temporalFilter.asOf && { as_of: request.temporalFilter.asOf }),
+            ...(request.temporalFilter.since && { since: request.temporalFilter.since }),
+            ...(request.temporalFilter.until && { until: request.temporalFilter.until }),
+            ...(request.temporalFilter.recencyWeight !== undefined && { recency_weight: request.temporalFilter.recencyWeight }),
+            ...(request.temporalFilter.recencyDecay && { recency_decay: request.temporalFilter.recencyDecay }),
+            ...(request.temporalFilter.decayHalfLife !== undefined && { decay_half_life: request.temporalFilter.decayHalfLife }),
+          },
+        }),
       },
     });
 
-    const results: SearchResult[] = data.results.map((r) => ({
-      id: r.id,
-      content: r.text ?? r.content ?? '',
-      score: r.score,
-      metadata: r.metadata ?? {},
-      documentId: r.document_id,
-      collectionId: r.collection_id,
-    }));
+    const results = this.mapSearchResults(data.results);
+    const fragments = Array.isArray(data.fragments)
+      ? data.fragments.filter(RagoraClient.isRecord)
+      : undefined;
 
     return {
+      object: data.object,
       results,
+      fragments,
+      systemInstruction: data.system_instruction,
+      knowledgeGraph: RagoraClient.isRecord(data.knowledge_graph)
+        ? data.knowledge_graph
+        : undefined,
+      globalGraphContext: RagoraClient.isRecord(data.global_graph_context)
+        ? data.global_graph_context
+        : undefined,
+      knowledgeGraphSummary: data.knowledge_graph_summary,
+      graphDebug: RagoraClient.isRecord(data.graph_debug)
+        ? data.graph_debug
+        : undefined,
       query: request.query,
       total: results.length,
       ...metadata,
@@ -270,21 +353,34 @@ export class RagoraClient {
         completion_tokens: number;
         total_tokens: number;
       };
-      sources?: Array<{
-        id: string;
-        content: string;
-        score: number;
-        metadata?: Record<string, unknown>;
-      }>;
+      sources?: unknown;
+      ragora_stats?: {
+        sources?: unknown;
+      };
     }>('POST', '/v1/chat/completions', {
       body: {
         ...(collectionIds && { collection_ids: collectionIds }),
+        ...(request.productIds && { product_ids: request.productIds }),
         messages: request.messages,
         model: request.model ?? 'gpt-4o-mini',
         temperature: request.temperature ?? 0.7,
         max_tokens: request.maxTokens,
         top_k: request.topK,
         stream: false,
+        ...(request.sourceType && { source_type: request.sourceType }),
+        ...(request.sourceName && { source_name: request.sourceName }),
+        ...(request.version && { version: request.version }),
+        ...(request.customTags && { custom_tags: request.customTags }),
+        ...(request.filters && { filters: request.filters }),
+        ...(request.enableReranker !== undefined && { enable_reranker: request.enableReranker }),
+        ...(request.metadata && {
+          metadata: {
+            ...(request.metadata.source && { source: request.metadata.source }),
+            ...(request.metadata.installationId && { installation_id: request.metadata.installationId }),
+            ...(request.metadata.channelId && { channel_id: request.metadata.channelId }),
+            ...(request.metadata.requesterId && { requester_id: request.metadata.requesterId }),
+          },
+        }),
       },
     });
 
@@ -297,12 +393,7 @@ export class RagoraClient {
       finishReason: c.finish_reason,
     }));
 
-    const sources: SearchResult[] = (data.sources ?? []).map((s) => ({
-      id: s.id,
-      content: s.content,
-      score: s.score,
-      metadata: s.metadata ?? {},
-    }));
+    const sources = this.extractChatSources(data as Record<string, unknown>);
 
     return {
       id: data.id,
@@ -346,12 +437,27 @@ export class RagoraClient {
         },
         body: JSON.stringify({
           ...(collectionIds && { collection_ids: collectionIds }),
+          ...(request.productIds && { product_ids: request.productIds }),
           messages: request.messages,
           model: request.model ?? 'gpt-4o-mini',
           temperature: request.temperature ?? 0.7,
           max_tokens: request.maxTokens,
           top_k: request.topK,
           stream: true,
+          ...(request.sourceType && { source_type: request.sourceType }),
+          ...(request.sourceName && { source_name: request.sourceName }),
+          ...(request.version && { version: request.version }),
+          ...(request.customTags && { custom_tags: request.customTags }),
+          ...(request.filters && { filters: request.filters }),
+          ...(request.enableReranker !== undefined && { enable_reranker: request.enableReranker }),
+          ...(request.metadata && {
+            metadata: {
+              ...(request.metadata.source && { source: request.metadata.source }),
+              ...(request.metadata.installationId && { installation_id: request.metadata.installationId }),
+              ...(request.metadata.channelId && { channel_id: request.metadata.channelId }),
+              ...(request.metadata.requesterId && { requester_id: request.metadata.requesterId }),
+            },
+          }),
         }),
         signal: controller.signal,
       });
@@ -368,53 +474,123 @@ export class RagoraClient {
 
       const decoder = new TextDecoder();
       let buffer = '';
+      let eventName = 'message';
+      let dataLines: string[] = [];
+
+      const parseEvent = (
+        currentEvent: string,
+        currentDataLines: string[]
+      ): { chunk?: ChatStreamChunk; done: boolean } => {
+        if (currentDataLines.length === 0) {
+          return { done: false };
+        }
+
+        const dataStr = currentDataLines.join('\n');
+        if (dataStr === '[DONE]') {
+          return { done: true };
+        }
+
+        try {
+          const parsed = JSON.parse(dataStr) as Record<string, unknown>;
+          if (!RagoraClient.isRecord(parsed)) {
+            return { done: false };
+          }
+
+          if (
+            currentEvent === 'ragora_metadata' ||
+            currentEvent === 'ragora_complete'
+          ) {
+            const sources = this.extractChatSources(parsed);
+            if (sources.length === 0) {
+              return { done: false };
+            }
+            return {
+              done: false,
+              chunk: {
+                content: '',
+                sources,
+              },
+            };
+          }
+
+          const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+          const firstChoice =
+            choices.length > 0 && RagoraClient.isRecord(choices[0])
+              ? choices[0]
+              : {};
+          const delta = RagoraClient.isRecord(firstChoice.delta)
+            ? firstChoice.delta
+            : {};
+
+          const content = typeof delta.content === 'string' ? delta.content : '';
+          const finishReason =
+            typeof firstChoice.finish_reason === 'string'
+              ? firstChoice.finish_reason
+              : undefined;
+          const sources = this.extractChatSources(parsed);
+
+          if (!content && !finishReason && sources.length === 0) {
+            return { done: false };
+          }
+
+          return {
+            done: false,
+            chunk: {
+              content,
+              finishReason,
+              sources,
+            },
+          };
+        } catch {
+          return { done: false };
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          const tail = buffer.trimEnd();
+          if (tail.startsWith('event:')) {
+            eventName = tail.slice(6).trim() || 'message';
+          } else if (tail.startsWith('data:')) {
+            dataLines.push(tail.slice(5).trimStart());
+          }
+
+          const parsed = parseEvent(eventName, dataLines);
+          if (parsed.chunk) {
+            yield parsed.chunk;
+          }
+          break;
+        }
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
 
-        for (const line of lines) {
-          if (!line.trim() || !line.startsWith('data: ')) continue;
+        for (const rawLine of lines) {
+          const line = rawLine.trimEnd();
 
-          const dataStr = line.slice(6); // Remove "data: " prefix
-          if (dataStr === '[DONE]') return;
+          if (!line) {
+            const parsed = parseEvent(eventName, dataLines);
+            dataLines = [];
+            eventName = 'message';
 
-          try {
-            const data = JSON.parse(dataStr) as {
-              choices?: Array<{
-                delta?: { content?: string };
-                finish_reason?: string;
-              }>;
-              sources?: Array<{
-                id: string;
-                content: string;
-                score: number;
-                metadata?: Record<string, unknown>;
-              }>;
-            };
-
-            const delta = data.choices?.[0]?.delta ?? {};
-            const finishReason = data.choices?.[0]?.finish_reason;
-
-            const sources: SearchResult[] = (data.sources ?? []).map((s) => ({
-              id: s.id,
-              content: s.content,
-              score: s.score,
-              metadata: s.metadata ?? {},
-            }));
-
-            yield {
-              content: delta.content ?? '',
-              finishReason,
-              sources,
-            };
-          } catch {
-            // Skip invalid JSON lines
+            if (parsed.chunk) {
+              yield parsed.chunk;
+            }
+            if (parsed.done) {
+              return;
+            }
             continue;
+          }
+
+          if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim() || 'message';
+            continue;
+          }
+
+          if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart());
           }
         }
       }
@@ -640,6 +816,7 @@ export class RagoraClient {
         name: request.name,
         description: request.description,
         slug: request.slug,
+        ...(request.capabilityConfig && { capability_config: request.capabilityConfig }),
       },
     });
 
