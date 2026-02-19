@@ -1,6 +1,6 @@
 {
   "name": "ragora",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Official Node.js SDK for the Ragora RAG API - Build AI-powered knowledge bases",
   "type": "module",
   "main": "dist/index.js",
