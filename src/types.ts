@@ -498,6 +498,153 @@ export interface MarketplaceListResponse extends ResponseMetadata {
   hasMore: boolean;
 }
 
+// --- Agent Types ---
+
+export interface Agent {
+  /** Agent ID */
+  id: string;
+  /** Organization ID */
+  orgId: string;
+  /** Agent name */
+  name: string;
+  /** Agent type (e.g. "support") */
+  type: string;
+  /** System prompt */
+  systemPrompt: string;
+  /** Linked collection IDs */
+  collectionIds: string[];
+  /** Memory configuration */
+  memoryConfig: Record<string, unknown>;
+  /** Budget configuration */
+  budgetConfig: Record<string, unknown>;
+  /** Agent status */
+  status: string;
+  /** Creation timestamp */
+  createdAt?: string;
+  /** Last update timestamp */
+  updatedAt?: string;
+}
+
+export interface CreateAgentRequest {
+  /** Agent name */
+  name: string;
+  /** Agent type (default: "support") */
+  type?: string;
+  /** System prompt */
+  systemPrompt?: string;
+  /** Collection IDs to link */
+  collectionIds: string[];
+  /** Memory configuration */
+  memoryConfig?: Record<string, unknown>;
+  /** Budget configuration */
+  budgetConfig?: Record<string, unknown>;
+}
+
+export interface UpdateAgentRequest {
+  /** New name */
+  name?: string;
+  /** New system prompt */
+  systemPrompt?: string;
+  /** New collection IDs */
+  collectionIds?: string[];
+  /** New memory config */
+  memoryConfig?: Record<string, unknown>;
+  /** New budget config */
+  budgetConfig?: Record<string, unknown>;
+  /** New status */
+  status?: string;
+}
+
+export interface AgentListResponse extends ResponseMetadata {
+  /** List of agents */
+  agents: Agent[];
+}
+
+export interface AgentChatRequest {
+  /** User message */
+  message: string;
+  /** Session ID to continue a conversation */
+  sessionId?: string;
+}
+
+export interface AgentChatResponse extends ResponseMetadata {
+  /** Assistant response */
+  message: string;
+  /** Session ID for follow-up messages */
+  sessionId: string;
+  /** Source citations */
+  citations: unknown[];
+  /** Usage statistics */
+  stats?: Record<string, unknown>;
+}
+
+export interface AgentChatStreamChunk {
+  /** Content delta */
+  content: string;
+  /** Session ID (available from first metadata event) */
+  sessionId?: string;
+  /** Final stats (only on last chunk when done=true) */
+  stats?: Record<string, unknown>;
+  /** Whether stream is complete */
+  done: boolean;
+}
+
+export interface AgentSession {
+  /** Session ID */
+  id: string;
+  /** Agent ID */
+  agentId: string;
+  /** Organization ID */
+  orgId: string;
+  /** Session source */
+  source: string;
+  /** Source key */
+  sourceKey?: string;
+  /** Visitor ID */
+  visitorId?: string;
+  /** Session status */
+  status: string;
+  /** Number of messages */
+  messageCount: number;
+  /** Creation timestamp */
+  createdAt?: string;
+  /** Last update timestamp */
+  updatedAt?: string;
+}
+
+export interface AgentSessionListResponse extends ResponseMetadata {
+  /** Sessions */
+  sessions: AgentSession[];
+  /** Total count */
+  total: number;
+}
+
+export interface AgentMessage {
+  /** Message ID */
+  id: string;
+  /** Session ID */
+  sessionId: string;
+  /** Role: user or assistant */
+  role: string;
+  /** Message content */
+  content: string;
+  /** Response latency in ms */
+  latencyMs?: number;
+  /** Cost in USD */
+  costUsd?: number;
+  /** Model used */
+  model?: string;
+  /** Creation timestamp */
+  createdAt?: string;
+}
+
+export interface AgentSessionDetailResponse extends ResponseMetadata {
+  /** Session details */
+  session: AgentSession;
+  /** Session messages */
+  messages: AgentMessage[];
+}
+
 // --- Error Types ---
 
 export interface APIErrorDetail {

@@ -38,6 +38,18 @@ export type {
   MarketplaceProduct,
   MarketplaceListRequest,
   MarketplaceListResponse,
+  // Agents
+  Agent,
+  CreateAgentRequest,
+  UpdateAgentRequest,
+  AgentListResponse,
+  AgentChatRequest,
+  AgentChatResponse,
+  AgentChatStreamChunk,
+  AgentSession,
+  AgentSessionListResponse,
+  AgentMessage,
+  AgentSessionDetailResponse,
   // Errors
   APIError,
   APIErrorDetail,

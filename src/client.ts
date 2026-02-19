@@ -6,6 +6,14 @@
 
 import { RagoraError } from './errors.js';
 import type {
+  Agent,
+  AgentChatRequest,
+  AgentChatResponse,
+  AgentChatStreamChunk,
+  AgentMessage,
+  AgentSession,
+  AgentSessionDetailResponse,
+  AgentSessionListResponse,
   APIError,
   ChatChoice,
   ChatRequest,
@@ -14,6 +22,7 @@ import type {
   Collection,
   CollectionListRequest,
   CollectionListResponse,
+  CreateAgentRequest,
   CreateCollectionRequest,
   CreditBalance,
   DeleteResponse,
@@ -21,6 +30,7 @@ import type {
   DocumentListRequest,
   DocumentListResponse,
   DocumentStatus,
+  AgentListResponse,
   Listing,
   MarketplaceListRequest,
   MarketplaceListResponse,
@@ -29,6 +39,7 @@ import type {
   SearchRequest,
   SearchResponse,
   SearchResult,
+  UpdateAgentRequest,
   UpdateCollectionRequest,
   UploadDocumentRequest,
   UploadResponse,
@@ -425,7 +436,12 @@ export class RagoraClient {
       : undefined;
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    // Use an inactivity timeout that resets on each chunk, not a fixed wall-clock timeout
+    let timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const resetTimeout = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    };
 
     try {
       const response = await this.fetchFn(url, {
@@ -562,6 +578,7 @@ export class RagoraClient {
           }
           break;
         }
+        resetTimeout();
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1261,6 +1278,321 @@ export class RagoraClient {
       listings,
       createdAt: p.created_at,
       updatedAt: p.updated_at,
+    };
+  }
+
+  private mapAgent(raw: Record<string, unknown>): Agent {
+    return {
+      id: String(raw.id ?? ''),
+      orgId: String(raw.org_id ?? ''),
+      name: String(raw.name ?? ''),
+      type: String(raw.type ?? 'support'),
+      systemPrompt: String(raw.system_prompt ?? ''),
+      collectionIds: Array.isArray(raw.collection_ids) ? raw.collection_ids.map(String) : [],
+      memoryConfig: RagoraClient.isRecord(raw.memory_config) ? raw.memory_config : {},
+      budgetConfig: RagoraClient.isRecord(raw.budget_config) ? raw.budget_config : {},
+      status: String(raw.status ?? 'active'),
+      createdAt: typeof raw.created_at === 'string' ? raw.created_at : undefined,
+      updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : undefined,
+    };
+  }
+
+  private mapAgentSession(raw: Record<string, unknown>): AgentSession {
+    return {
+      id: String(raw.id ?? ''),
+      agentId: String(raw.agent_id ?? ''),
+      orgId: String(raw.org_id ?? ''),
+      source: String(raw.source ?? ''),
+      sourceKey: typeof raw.source_key === 'string' ? raw.source_key : undefined,
+      visitorId: typeof raw.visitor_id === 'string' ? raw.visitor_id : undefined,
+      status: String(raw.status ?? 'open'),
+      messageCount: typeof raw.message_count === 'number' ? raw.message_count : 0,
+      createdAt: typeof raw.created_at === 'string' ? raw.created_at : undefined,
+      updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : undefined,
+    };
+  }
+
+  // --- Agents ---
+
+  /**
+   * Create a new agent.
+   */
+  async createAgent(request: CreateAgentRequest): Promise<Agent> {
+    const { data } = await this.request<Record<string, unknown>>('POST', '/v1/agents', {
+      body: {
+        name: request.name,
+        ...(request.type && { type: request.type }),
+        ...(request.systemPrompt && { system_prompt: request.systemPrompt }),
+        collection_ids: request.collectionIds,
+        ...(request.memoryConfig && { memory_config: request.memoryConfig }),
+        ...(request.budgetConfig && { budget_config: request.budgetConfig }),
+      },
+    });
+    return this.mapAgent(data);
+  }
+
+  /**
+   * List all agents.
+   */
+  async listAgents(): Promise<AgentListResponse> {
+    const { data, metadata } = await this.request<{ agents: Record<string, unknown>[] }>(
+      'GET', '/v1/agents'
+    );
+    return {
+      agents: (data.agents ?? []).map((a) => this.mapAgent(a)),
+      ...metadata,
+    };
+  }
+
+  /**
+   * Get an agent by ID.
+   */
+  async getAgent(agentId: string): Promise<Agent> {
+    const { data } = await this.request<Record<string, unknown>>(
+      'GET', `/v1/agents/${agentId}`
+    );
+    return this.mapAgent(data);
+  }
+
+  /**
+   * Update an agent.
+   */
+  async updateAgent(agentId: string, request: UpdateAgentRequest): Promise<Agent> {
+    const body: Record<string, unknown> = {};
+    if (request.name !== undefined) body.name = request.name;
+    if (request.systemPrompt !== undefined) body.system_prompt = request.systemPrompt;
+    if (request.collectionIds !== undefined) body.collection_ids = request.collectionIds;
+    if (request.memoryConfig !== undefined) body.memory_config = request.memoryConfig;
+    if (request.budgetConfig !== undefined) body.budget_config = request.budgetConfig;
+    if (request.status !== undefined) body.status = request.status;
+
+    const { data } = await this.request<Record<string, unknown>>(
+      'PATCH', `/v1/agents/${agentId}`, { body }
+    );
+    return this.mapAgent(data);
+  }
+
+  /**
+   * Delete an agent.
+   */
+  async deleteAgent(agentId: string): Promise<DeleteResponse> {
+    const { data } = await this.request<{ message: string; id?: string }>(
+      'DELETE', `/v1/agents/${agentId}`
+    );
+    return {
+      message: data.message ?? 'Agent deleted',
+      id: data.id ?? agentId,
+    };
+  }
+
+  /**
+   * Chat with an agent.
+   */
+  async agentChat(agentId: string, request: AgentChatRequest): Promise<AgentChatResponse> {
+    const { data, metadata } = await this.request<{
+      message: string;
+      session_id: string;
+      citations: unknown[];
+      stats?: Record<string, unknown>;
+    }>('POST', `/v1/agents/${agentId}/chat`, {
+      body: {
+        message: request.message,
+        ...(request.sessionId && { session_id: request.sessionId }),
+        stream: false,
+      },
+    });
+
+    return {
+      message: data.message,
+      sessionId: data.session_id,
+      citations: data.citations ?? [],
+      stats: data.stats,
+      ...metadata,
+    };
+  }
+
+  /**
+   * Stream a chat with an agent.
+   */
+  async *agentChatStream(
+    agentId: string,
+    request: AgentChatRequest
+  ): AsyncGenerator<AgentChatStreamChunk> {
+    const url = `${this.baseUrl}/v1/agents/${agentId}/chat`;
+
+    const controller = new AbortController();
+    // Use an inactivity timeout that resets on each chunk, not a fixed wall-clock timeout
+    let timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const resetTimeout = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    };
+
+    try {
+      const response = await this.fetchFn(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'ragora-js/0.1.0',
+        },
+        body: JSON.stringify({
+          message: request.message,
+          ...(request.sessionId && { session_id: request.sessionId }),
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const metadata = this.extractMetadata(response.headers);
+        await this.handleError(response, metadata.requestId);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Response body is not readable');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let eventName = 'message';
+      let dataLines: string[] = [];
+      let sessionId: string | undefined;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        resetTimeout();
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trimEnd();
+
+          if (!line) {
+            // Process event
+            if (dataLines.length > 0) {
+              const dataStr = dataLines.join('\n');
+              dataLines = [];
+
+              if (dataStr === '[DONE]') {
+                eventName = 'message';
+                return;
+              }
+
+              try {
+                const parsed = JSON.parse(dataStr) as Record<string, unknown>;
+
+                if (eventName === 'ragora_metadata' || eventName === 'ragora_status') {
+                  if (RagoraClient.isRecord(parsed.ragora_stats)) {
+                    const stats = parsed.ragora_stats as Record<string, unknown>;
+                    if (typeof stats.conversation_id === 'string') {
+                      sessionId = stats.conversation_id;
+                    }
+                  }
+                } else if (eventName === 'ragora_complete') {
+                  const stats = RagoraClient.isRecord(parsed.ragora_stats)
+                    ? (parsed.ragora_stats as Record<string, unknown>)
+                    : undefined;
+                  yield { content: '', sessionId, stats, done: true };
+                } else {
+                  // Content chunk
+                  const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+                  const firstChoice =
+                    choices.length > 0 && RagoraClient.isRecord(choices[0]) ? choices[0] : {};
+                  const delta = RagoraClient.isRecord(firstChoice.delta)
+                    ? firstChoice.delta
+                    : {};
+                  const content = typeof delta.content === 'string' ? delta.content : '';
+                  if (content) {
+                    yield { content, sessionId, done: false };
+                  }
+                }
+              } catch {
+                // skip malformed JSON
+              }
+            }
+            eventName = 'message';
+            continue;
+          }
+
+          if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim() || 'message';
+            continue;
+          }
+
+          if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * List sessions for an agent.
+   */
+  async listAgentSessions(agentId: string): Promise<AgentSessionListResponse> {
+    const { data, metadata } = await this.request<{
+      sessions: Record<string, unknown>[];
+      total: number;
+    }>('GET', `/v1/agents/${agentId}/sessions`);
+
+    return {
+      sessions: (data.sessions ?? []).map((s) => this.mapAgentSession(s)),
+      total: data.total ?? 0,
+      ...metadata,
+    };
+  }
+
+  /**
+   * Get an agent session with its messages.
+   */
+  async getAgentSession(
+    agentId: string,
+    sessionId: string
+  ): Promise<AgentSessionDetailResponse> {
+    const { data, metadata } = await this.request<{
+      session: Record<string, unknown>;
+      messages: Record<string, unknown>[];
+    }>('GET', `/v1/agents/${agentId}/sessions/${sessionId}`);
+
+    const messages: AgentMessage[] = (data.messages ?? []).map((m) => ({
+      id: String(m.id ?? ''),
+      sessionId: String(m.session_id ?? ''),
+      role: String(m.role ?? ''),
+      content: String(m.content ?? ''),
+      latencyMs: typeof m.latency_ms === 'number' ? m.latency_ms : undefined,
+      costUsd: typeof m.cost_usd === 'number' ? m.cost_usd : undefined,
+      model: typeof m.model === 'string' ? m.model : undefined,
+      createdAt: typeof m.created_at === 'string' ? m.created_at : undefined,
+    }));
+
+    return {
+      session: this.mapAgentSession(data.session ?? {}),
+      messages,
+      ...metadata,
+    };
+  }
+
+  /**
+   * Delete/resolve an agent session and clean up its memory.
+   */
+  async deleteAgentSession(
+    agentId: string,
+    sessionId: string
+  ): Promise<DeleteResponse> {
+    const { data } = await this.request<{ status: string }>(
+      'DELETE', `/v1/agents/${agentId}/sessions/${sessionId}`
+    );
+    return {
+      message: data.status ?? 'resolved',
+      id: sessionId,
     };
   }
 }

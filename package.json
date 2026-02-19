@@ -46,6 +46,7 @@
     "example:marketplace": "npx tsx examples/marketplace.ts",
     "example:credits": "npx tsx examples/credits.ts",
     "example:nextjs": "npx tsx examples/nextjs-integration.ts",
+    "example:agentic-rag": "npx tsx examples/agentic-rag/chat.ts",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit"
   },
