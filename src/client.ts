@@ -4,7 +4,7 @@
  * Fetch-based HTTP client for the Ragora API.
  */
 
-import { RagoraError } from './errors.js';
+import { RagoraError, AuthenticationError, AuthorizationError, NotFoundError, RateLimitError, ServerError } from './errors.js';
 import type {
   Agent,
   AgentChatRequest,
@@ -35,6 +35,7 @@ import type {
   MarketplaceListRequest,
   MarketplaceListResponse,
   MarketplaceProduct,
+  RequestOptions,
   ResponseMetadata,
   SearchRequest,
   SearchResponse,
@@ -45,31 +46,130 @@ import type {
   UploadResponse,
 } from './types.js';
 
+const SDK_VERSION = '0.2.0';
+
 export interface RagoraClientOptions {
-  /** Your Ragora API key */
-  apiKey: string;
-  /** API base URL (default: https://api.ragora.app) */
+  /** Your Ragora API key (falls back to RAGORA_API_KEY env var) */
+  apiKey?: string;
+  /** API base URL (falls back to RAGORA_BASE_URL env var, default: https://api.ragora.app) */
   baseUrl?: string;
   /** Request timeout in milliseconds (default: 30000) */
   timeout?: number;
+  /**
+   * Maximum number of retries for rate-limit (429) and server errors (5xx).
+   * Set to 0 to disable automatic retries. Default: 2.
+   */
+  maxRetries?: number;
   /** Custom fetch implementation (for testing or environments without global fetch) */
   fetch?: typeof fetch;
+  /** String appended to the default User-Agent header */
+  userAgentSuffix?: string;
+  /** Enable debug logging. Pass `true` to use console.debug, or a custom log function. */
+  debug?: boolean | ((msg: string, ...args: unknown[]) => void);
 }
 
 export class RagoraClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly timeout: number;
+  private readonly maxRetries: number;
   private readonly fetchFn: typeof fetch;
+  private readonly userAgent: string;
+  private readonly debugLog?: (msg: string, ...args: unknown[]) => void;
+  private readonly resolverCacheTtlMs: number = 5 * 60 * 1000;
+  private readonly collectionRefCache = new Map<
+    string,
+    { resolvedId: string; expiresAt: number }
+  >();
+  private readonly productRefCache = new Map<
+    string,
+    { resolvedId: string; expiresAt: number }
+  >();
+
+  private static readonly RETRYABLE_STATUS_CODES = new Set([
+    429, 500, 502, 503, 504,
+  ]);
 
   constructor(options: RagoraClientOptions) {
-    this.apiKey = options.apiKey;
-    this.baseUrl = (options.baseUrl ?? 'https://api.ragora.app').replace(
+    const resolvedApiKey = options.apiKey ?? process.env.RAGORA_API_KEY;
+    if (!resolvedApiKey) {
+      throw new Error(
+        'apiKey must be provided or set via the RAGORA_API_KEY environment variable'
+      );
+    }
+    this.apiKey = resolvedApiKey;
+    this.baseUrl = (options.baseUrl ?? process.env.RAGORA_BASE_URL ?? 'https://api.ragora.app').replace(
       /\/$/,
       ''
     );
     this.timeout = options.timeout ?? 30000;
+    this.maxRetries = options.maxRetries ?? 2;
     this.fetchFn = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.userAgent = `ragora-js/${SDK_VERSION}${options.userAgentSuffix ? ` ${options.userAgentSuffix}` : ''}`;
+    if (options.debug) {
+      this.debugLog = typeof options.debug === 'function'
+        ? options.debug
+        : (msg: string, ...args: unknown[]) => console.debug(`[ragora] ${msg}`, ...args);
+    }
+  }
+
+  /**
+   * Extract retry delay from response headers (Retry-After or X-RateLimit-Reset).
+   */
+  private static getRetryAfter(headers: Headers): number | undefined {
+    const retryAfter = headers.get('Retry-After');
+    if (retryAfter) {
+      const parsed = parseFloat(retryAfter);
+      if (!isNaN(parsed) && parsed > 0) return parsed;
+    }
+    const reset = headers.get('X-RateLimit-Reset');
+    if (reset) {
+      const parsed = parseFloat(reset);
+      if (!isNaN(parsed) && parsed > 0) return parsed;
+    }
+    return undefined;
+  }
+
+  private log(msg: string, ...args: unknown[]): void {
+    this.debugLog?.(msg, ...args);
+  }
+
+  private static buildError(
+    message: string,
+    statusCode: number,
+    error?: APIError,
+    requestId?: string,
+    retryAfter?: number
+  ): RagoraError {
+    if (statusCode === 401) return new AuthenticationError(message, error, requestId);
+    if (statusCode === 403) return new AuthorizationError(message, error, requestId);
+    if (statusCode === 404) return new NotFoundError(message, error, requestId);
+    if (statusCode === 429) return new RateLimitError(message, error, requestId, retryAfter);
+    if (statusCode >= 500) return new ServerError(message, statusCode, error, requestId);
+    return new RagoraError(message, statusCode, error, requestId);
+  }
+
+  /**
+   * Calculate retry delay with exponential backoff and jitter.
+   *
+   * If the server sent a Retry-After / X-RateLimit-Reset header, that value
+   * is used as the base delay (uncapped — the server knows best). Otherwise
+   * falls back to exponential backoff capped at 30 seconds.
+   */
+  private static retryDelay(
+    attempt: number,
+    retryAfter?: number
+  ): number {
+    const base =
+      retryAfter !== undefined && retryAfter > 0
+        ? retryAfter
+        : Math.min(2 ** attempt, 30); // 1, 2, 4, 8, 16, 30
+    // Jitter: 0.5x–1.0x of base
+    return base * (0.5 + Math.random() * 0.5);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -106,7 +206,7 @@ export class RagoraClient {
   }
 
   /**
-   * Make an API request.
+   * Make an API request with automatic retry for rate-limit and server errors.
    */
   private async request<T>(
     method: string,
@@ -114,6 +214,8 @@ export class RagoraClient {
     options?: {
       body?: unknown;
       params?: Record<string, string | number | undefined>;
+      requestId?: string;
+      timeout?: number;
     }
   ): Promise<{ data: T; metadata: ResponseMetadata }> {
     const url = new URL(`${this.baseUrl}${path}`);
@@ -126,32 +228,55 @@ export class RagoraClient {
       }
     }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const effectiveTimeout = options?.timeout ?? this.timeout;
+    this.log(`Request: ${method} ${path}`);
 
-    try {
-      const response = await this.fetchFn(url.toString(), {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'ragora-js/0.1.0',
-        },
-        body: options?.body ? JSON.stringify(options.body) : undefined,
-        signal: controller.signal,
-      });
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
-      const metadata = this.extractMetadata(response.headers);
+      try {
+        const response = await this.fetchFn(url.toString(), {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            'User-Agent': this.userAgent,
+            ...(options?.requestId && { 'X-Request-ID': options.requestId }),
+          },
+          body: options?.body ? JSON.stringify(options.body) : undefined,
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
+        this.log(`Response: ${method} ${path} -> ${response.status}`);
+        const metadata = this.extractMetadata(response.headers);
+
+        if (response.ok) {
+          const data = (await response.json()) as T;
+          return { data, metadata };
+        }
+
+        if (
+          RagoraClient.RETRYABLE_STATUS_CODES.has(response.status) &&
+          attempt < this.maxRetries
+        ) {
+          const delay = RagoraClient.retryDelay(
+            attempt,
+            RagoraClient.getRetryAfter(response.headers)
+          );
+          this.log(`Retry attempt ${attempt + 1} after ${(delay).toFixed(1)}s delay`);
+          await this.sleep(delay * 1000);
+          continue;
+        }
+
         await this.handleError(response, metadata.requestId);
+      } finally {
+        clearTimeout(timeoutId);
       }
-
-      const data = (await response.json()) as T;
-      return { data, metadata };
-    } finally {
-      clearTimeout(timeoutId);
     }
+
+    // Unreachable — handleError always throws
+    throw new RagoraError('request failed', 0);
   }
 
   /**
@@ -161,6 +286,7 @@ export class RagoraClient {
     response: Response,
     requestId?: string
   ): Promise<never> {
+    const retryAfter = RagoraClient.getRetryAfter(response.headers);
     try {
       const data = (await response.json()) as Record<string, unknown>;
 
@@ -173,35 +299,39 @@ export class RagoraClient {
             details: Array.isArray(errorData.details) ? errorData.details : [],
             requestId,
           };
-          throw new RagoraError(
+          throw RagoraClient.buildError(
             error.message,
             response.status,
             error,
-            requestId
+            requestId,
+            retryAfter
           );
         }
-        throw new RagoraError(
+        throw RagoraClient.buildError(
           String(errorData),
           response.status,
           undefined,
-          requestId
+          requestId,
+          retryAfter
         );
       }
 
-      throw new RagoraError(
+      throw RagoraClient.buildError(
         String(data.message ?? response.statusText),
         response.status,
         undefined,
-        requestId
+        requestId,
+        retryAfter
       );
     } catch (e) {
       if (e instanceof RagoraError) throw e;
 
-      throw new RagoraError(
+      throw RagoraClient.buildError(
         response.statusText || `HTTP ${response.status}`,
         response.status,
         undefined,
-        requestId
+        requestId,
+        retryAfter
       );
     }
   }
@@ -209,6 +339,9 @@ export class RagoraClient {
   private static isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
+
+  private static readonly UUID_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   private toSearchResult(raw: Record<string, unknown>): SearchResult {
     const scoreRaw = raw.score;
@@ -219,12 +352,20 @@ export class RagoraClient {
       ? raw.metadata
       : {};
 
+    // Extract source_url: prefer top-level field, fall back to metadata
+    const sourceUrl =
+      (typeof raw.source_url === 'string' && raw.source_url ? raw.source_url : undefined) ??
+      (RagoraClient.isRecord(raw.metadata) && typeof (raw.metadata as Record<string, unknown>).source_url === 'string'
+        ? (raw.metadata as Record<string, unknown>).source_url as string
+        : undefined);
+
     return {
       id: String(raw.id ?? raw.chunk_id ?? ''),
       content:
         (typeof raw.text === 'string' ? raw.text : undefined) ??
         (typeof raw.content === 'string' ? raw.content : ''),
       score: Number.isFinite(parsedScore) ? parsedScore : 0,
+      sourceUrl: sourceUrl || undefined,
       metadata,
       documentId:
         typeof raw.document_id === 'string' ? raw.document_id : undefined,
@@ -256,17 +397,425 @@ export class RagoraClient {
     return this.mapSearchResults(payload.sources);
   }
 
+  private normalizeIdentifierKey(value: string): string {
+    return value.trim().toLowerCase();
+  }
+
+  private cacheGet(
+    cache: Map<string, { resolvedId: string; expiresAt: number }>,
+    key: string
+  ): string | undefined {
+    const cached = cache.get(key);
+    if (!cached) {
+      return undefined;
+    }
+    if (cached.expiresAt <= Date.now()) {
+      cache.delete(key);
+      return undefined;
+    }
+    return cached.resolvedId;
+  }
+
+  private cacheSet(
+    cache: Map<string, { resolvedId: string; expiresAt: number }>,
+    key: string,
+    resolvedId: string
+  ): void {
+    cache.set(key, {
+      resolvedId,
+      expiresAt: Date.now() + this.resolverCacheTtlMs,
+    });
+  }
+
+  private previewId(rawId: string): string {
+    if (rawId.length <= 10) {
+      return rawId;
+    }
+    return `${rawId.slice(0, 8)}...`;
+  }
+
+  private throwAmbiguousIdentifier(
+    kind: 'collection' | 'product',
+    identifier: string,
+    candidates: string[]
+  ): never {
+    const message =
+      `Ambiguous ${kind} '${identifier}'. ` +
+      `Matches: ${candidates.slice(0, 5).join(', ')}. ` +
+      'Use slug or UUID for an exact match.';
+    throw new RagoraError(message, 400, {
+      code: 'AMBIGUOUS_IDENTIFIER',
+      message,
+      details: [],
+    });
+  }
+
+  private throwIdentifierNotFound(
+    kind: 'collection' | 'product',
+    identifier: string
+  ): never {
+    const message =
+      `${kind.charAt(0).toUpperCase()}${kind.slice(1)} '${identifier}' was not found in your accessible scope. ` +
+      'Use list endpoints or pass slug/UUID.';
+    throw new RagoraError(message, 404, {
+      code: 'IDENTIFIER_NOT_FOUND',
+      message,
+      details: [],
+    });
+  }
+
+  private throwConflictingReferenceInputs(
+    preferred: string,
+    legacy: string
+  ): never {
+    throw new Error(`Pass either '${preferred}' or '${legacy}', not both.`);
+  }
+
+  private normalizeReferenceList(
+    refs: string | string[],
+    label: string
+  ): string[] {
+    const rawValues = Array.isArray(refs) ? refs : [refs];
+    const normalized: string[] = [];
+
+    for (const value of rawValues) {
+      if (typeof value !== 'string') {
+        throw new TypeError(`${label} values must be strings.`);
+      }
+      const cleaned = value.trim();
+      if (cleaned.length === 0) {
+        throw new Error(`${label} cannot contain empty values.`);
+      }
+      normalized.push(cleaned);
+    }
+
+    if (normalized.length === 0) {
+      throw new Error(`${label} cannot be empty.`);
+    }
+    return normalized;
+  }
+
+  private dedupePreserveOrder(values: string[]): string[] {
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+    for (const value of values) {
+      const normalized = this.normalizeIdentifierKey(value);
+      if (seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      deduped.push(value);
+    }
+    return deduped;
+  }
+
+  private async listAccessibleCollectionsRaw(): Promise<Record<string, unknown>[]> {
+    const allItems: Record<string, unknown>[] = [];
+    const limit = 100;
+    let offset = 0;
+
+    for (let i = 0; i < 50; i++) {
+      const { data } = await this.request<{
+        data?: unknown;
+        hasMore?: boolean;
+        has_more?: boolean;
+      }>('GET', '/v1/collections', {
+        params: { limit, offset },
+      });
+
+      if (Array.isArray(data.data)) {
+        for (const item of data.data) {
+          if (RagoraClient.isRecord(item)) {
+            allItems.push(item);
+          }
+        }
+      }
+
+      const hasMore = Boolean(data.hasMore ?? data.has_more ?? false);
+      if (!hasMore) {
+        break;
+      }
+      offset += limit;
+    }
+
+    return allItems;
+  }
+
+  private async listAccessibleProductsRaw(): Promise<Record<string, unknown>[]> {
+    const { data } = await this.request<{ data?: unknown }>(
+      'GET',
+      '/v1/products/accessible'
+    );
+    if (!Array.isArray(data.data)) {
+      return [];
+    }
+
+    const items: Record<string, unknown>[] = [];
+    for (const item of data.data) {
+      if (RagoraClient.isRecord(item)) {
+        items.push(item);
+      }
+    }
+    return items;
+  }
+
+  private async resolveCollection(collection: string): Promise<string> {
+    const ref = collection.trim();
+    if (!ref) {
+      throw new Error('collection cannot be empty');
+    }
+
+    const cacheKey = this.normalizeIdentifierKey(ref);
+    const cached = this.cacheGet(this.collectionRefCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    if (RagoraClient.UUID_PATTERN.test(ref)) {
+      this.cacheSet(this.collectionRefCache, cacheKey, ref);
+      return ref;
+    }
+
+    const refLower = ref.toLowerCase();
+    const collections = await this.listAccessibleCollectionsRaw();
+
+    const idMatches = collections.filter(
+      (item) => typeof item.id === 'string' && item.id === ref
+    );
+    if (idMatches.length === 1) {
+      const resolved = String(idMatches[0].id);
+      this.cacheSet(this.collectionRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    const slugMatches = collections.filter(
+      (item) =>
+        typeof item.id === 'string' &&
+        typeof item.slug === 'string' &&
+        item.slug.toLowerCase() === refLower
+    );
+    if (slugMatches.length === 1) {
+      const resolved = String(slugMatches[0].id ?? '');
+      this.cacheSet(this.collectionRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    const nameMatches = collections.filter(
+      (item) =>
+        typeof item.id === 'string' &&
+        typeof item.name === 'string' &&
+        item.name.toLowerCase() === refLower
+    );
+    if (nameMatches.length > 1) {
+      const candidates = nameMatches.map((match) => {
+        const name = typeof match.name === 'string' ? match.name : '';
+        const slug = typeof match.slug === 'string' ? match.slug : '-';
+        const id = typeof match.id === 'string' ? match.id : '';
+        return `${name} (slug=${slug}, id=${this.previewId(id)})`;
+      });
+      this.throwAmbiguousIdentifier('collection', ref, candidates);
+    }
+    if (nameMatches.length === 1) {
+      const resolved = String(nameMatches[0].id ?? '');
+      this.cacheSet(this.collectionRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    const products = await this.listAccessibleProductsRaw();
+    const productSlugMatches = products.filter(
+      (item) =>
+        typeof item.slug === 'string' && item.slug.toLowerCase() === refLower
+    );
+    const productTitleMatches = products.filter(
+      (item) =>
+        typeof item.title === 'string' && item.title.toLowerCase() === refLower
+    );
+    const productCollectionSlugMatches = products.filter(
+      (item) =>
+        typeof item.collection_slug === 'string' &&
+        item.collection_slug.toLowerCase() === refLower
+    );
+    const productCollectionNameMatches = products.filter(
+      (item) =>
+        typeof item.collection_name === 'string' &&
+        item.collection_name.toLowerCase() === refLower
+    );
+    const baseProductMatches =
+      productSlugMatches.length > 0
+        ? productSlugMatches
+        : productTitleMatches.length > 0
+          ? productTitleMatches
+          : productCollectionSlugMatches.length > 0
+            ? productCollectionSlugMatches
+            : productCollectionNameMatches;
+    const productMatches = baseProductMatches.filter(
+      (item) =>
+        typeof item.collection_id === 'string' && item.collection_id.trim() !== ''
+    );
+    if (productMatches.length > 1) {
+      const candidates = productMatches.map((match) => {
+        const title = typeof match.title === 'string' ? match.title : '';
+        const slug = typeof match.slug === 'string' ? match.slug : '-';
+        const id = typeof match.id === 'string' ? match.id : '';
+        return `${title} (slug=${slug}, id=${this.previewId(id)})`;
+      });
+      this.throwAmbiguousIdentifier('collection', ref, candidates);
+    }
+    if (productMatches.length === 1) {
+      const resolved = String(productMatches[0].collection_id);
+      this.cacheSet(this.collectionRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    this.throwIdentifierNotFound('collection', ref);
+  }
+
+  private async resolveProduct(product: string): Promise<string> {
+    const ref = product.trim();
+    if (!ref) {
+      throw new Error('product cannot be empty');
+    }
+
+    const cacheKey = this.normalizeIdentifierKey(ref);
+    const cached = this.cacheGet(this.productRefCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    if (RagoraClient.UUID_PATTERN.test(ref)) {
+      this.cacheSet(this.productRefCache, cacheKey, ref);
+      return ref;
+    }
+
+    const refLower = ref.toLowerCase();
+    const products = await this.listAccessibleProductsRaw();
+
+    const idMatches = products.filter(
+      (item) => typeof item.id === 'string' && item.id === ref
+    );
+    if (idMatches.length === 1) {
+      const resolved = String(idMatches[0].id);
+      this.cacheSet(this.productRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    const slugMatches = products.filter(
+      (item) =>
+        typeof item.id === 'string' &&
+        typeof item.slug === 'string' &&
+        item.slug.toLowerCase() === refLower
+    );
+    if (slugMatches.length === 1) {
+      const resolved = String(slugMatches[0].id ?? '');
+      this.cacheSet(this.productRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    const titleMatches = products.filter(
+      (item) =>
+        typeof item.id === 'string' &&
+        typeof item.title === 'string' &&
+        item.title.toLowerCase() === refLower
+    );
+    if (titleMatches.length > 1) {
+      const candidates = titleMatches.map((match) => {
+        const title = typeof match.title === 'string' ? match.title : '';
+        const slug = typeof match.slug === 'string' ? match.slug : '-';
+        const id = typeof match.id === 'string' ? match.id : '';
+        return `${title} (slug=${slug}, id=${this.previewId(id)})`;
+      });
+      this.throwAmbiguousIdentifier('product', ref, candidates);
+    }
+    if (titleMatches.length === 1) {
+      const resolved = String(titleMatches[0].id ?? '');
+      this.cacheSet(this.productRefCache, cacheKey, resolved);
+      return resolved;
+    }
+
+    this.throwIdentifierNotFound('product', ref);
+  }
+
+  private async resolveCollectionIds(options: {
+    collection?: string | string[];
+    collectionId?: string | string[];
+  }): Promise<string[] | undefined> {
+    if (options.collection !== undefined && options.collectionId !== undefined) {
+      this.throwConflictingReferenceInputs('collection', 'collectionId');
+    }
+
+    if (options.collection === undefined) {
+      if (options.collectionId === undefined) {
+        return undefined;
+      }
+      const legacyRefs = this.normalizeReferenceList(
+        options.collectionId,
+        'collectionId'
+      );
+      return this.dedupePreserveOrder(legacyRefs);
+    }
+
+    const refs = this.normalizeReferenceList(options.collection, 'collection');
+    const resolved: string[] = [];
+    for (const ref of refs) {
+      resolved.push(await this.resolveCollection(ref));
+    }
+    return this.dedupePreserveOrder(resolved);
+  }
+
+  private async resolveSingleCollectionId(options: {
+    collection?: string;
+    collectionId?: string;
+  }): Promise<string | undefined> {
+    const resolved = await this.resolveCollectionIds({
+      collection: options.collection,
+      collectionId: options.collectionId,
+    });
+    if (!resolved) {
+      return undefined;
+    }
+    if (resolved.length !== 1) {
+      throw new Error('Exactly one collection must be provided for this operation.');
+    }
+    return resolved[0];
+  }
+
+  private async resolveProductIds(options: {
+    products?: string | string[];
+    productIds?: string[];
+  }): Promise<string[] | undefined> {
+    if (options.products !== undefined && options.productIds !== undefined) {
+      this.throwConflictingReferenceInputs('products', 'productIds');
+    }
+
+    if (options.products === undefined) {
+      if (options.productIds === undefined) {
+        return undefined;
+      }
+      const legacyRefs = this.normalizeReferenceList(
+        options.productIds,
+        'productIds'
+      );
+      return this.dedupePreserveOrder(legacyRefs);
+    }
+
+    const refs = this.normalizeReferenceList(options.products, 'products');
+    const resolved: string[] = [];
+    for (const ref of refs) {
+      resolved.push(await this.resolveProduct(ref));
+    }
+    return this.dedupePreserveOrder(resolved);
+  }
+
   // --- Search ---
 
   /**
    * Search for relevant documents in a collection.
    */
-  async search(request: SearchRequest): Promise<SearchResponse> {
-    const collectionIds = request.collectionId
-      ? Array.isArray(request.collectionId)
-        ? request.collectionId
-        : [request.collectionId]
-      : undefined;
+  async search(request: SearchRequest, options?: RequestOptions): Promise<SearchResponse> {
+    const collectionIds = await this.resolveCollectionIds({
+      collection: request.collection,
+      collectionId: request.collectionId,
+    });
 
     const { data, metadata } = await this.request<{
       object?: string;
@@ -296,6 +845,10 @@ export class RagoraClient {
           graph_filter: {
             ...(request.graphFilter.entities && { entities: request.graphFilter.entities }),
             ...(request.graphFilter.entityType && { entity_type: request.graphFilter.entityType }),
+            ...(request.graphFilter.versionOf && { version_of: request.graphFilter.versionOf }),
+            ...(request.graphFilter.relationType && { relation_type: request.graphFilter.relationType }),
+            ...(request.graphFilter.fileIds && { file_ids: request.graphFilter.fileIds }),
+            ...(request.graphFilter.mode && { mode: request.graphFilter.mode }),
           },
         }),
         ...(request.temporalFilter && {
@@ -309,6 +862,8 @@ export class RagoraClient {
           },
         }),
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     const results = this.mapSearchResults(data.results);
@@ -342,12 +897,19 @@ export class RagoraClient {
   /**
    * Generate a chat completion with RAG context.
    */
-  async chat(request: ChatRequest): Promise<ChatResponse> {
-    const collectionIds = request.collectionId
-      ? Array.isArray(request.collectionId)
-        ? request.collectionId
-        : [request.collectionId]
-      : undefined;
+  async chat(request: ChatRequest, options?: RequestOptions): Promise<ChatResponse> {
+    const retrieval = request.retrieval ?? {};
+    const generation = request.generation ?? {};
+    const agentic = request.agentic ?? {};
+
+    const collectionIds = await this.resolveCollectionIds({
+      collection: retrieval.collection,
+      collectionId: retrieval.collectionId,
+    });
+    const productIds = await this.resolveProductIds({
+      products: retrieval.products,
+      productIds: retrieval.productIds,
+    });
 
     const { data, metadata } = await this.request<{
       id: string;
@@ -368,22 +930,54 @@ export class RagoraClient {
       ragora_stats?: {
         sources?: unknown;
       };
+      ragora?: {
+        citations?: Array<{ ref?: number; text?: string; source?: string; score?: number }>;
+        session_id?: string;
+      };
     }>('POST', '/v1/chat/completions', {
       body: {
         ...(collectionIds && { collection_ids: collectionIds }),
-        ...(request.productIds && { product_ids: request.productIds }),
+        ...(productIds && { product_ids: productIds }),
         messages: request.messages,
-        model: request.model ?? 'gpt-4o-mini',
-        temperature: request.temperature ?? 0.7,
-        max_tokens: request.maxTokens,
-        top_k: request.topK,
+        ...(generation.model && { model: generation.model }),
+        temperature: generation.temperature ?? 0.7,
+        max_tokens: generation.maxTokens,
+        top_k: retrieval.topK,
         stream: false,
-        ...(request.sourceType && { source_type: request.sourceType }),
-        ...(request.sourceName && { source_name: request.sourceName }),
-        ...(request.version && { version: request.version }),
-        ...(request.customTags && { custom_tags: request.customTags }),
-        ...(request.filters && { filters: request.filters }),
-        ...(request.enableReranker !== undefined && { enable_reranker: request.enableReranker }),
+        ...(agentic.mode && { mode: agentic.mode }),
+        ...(agentic.systemPrompt && { system_prompt: agentic.systemPrompt }),
+        ...(agentic.session !== undefined && { session: agentic.session }),
+        ...(agentic.sessionId && { session_id: agentic.sessionId }),
+        ...(retrieval.sourceType && { source_type: retrieval.sourceType }),
+        ...(retrieval.sourceName && { source_name: retrieval.sourceName }),
+        ...(retrieval.version && { version: retrieval.version }),
+        ...(retrieval.versionMode && { version_mode: retrieval.versionMode }),
+        ...(retrieval.documentKeys && { document_keys: retrieval.documentKeys }),
+        ...(retrieval.customTags && { custom_tags: retrieval.customTags }),
+        ...(retrieval.domain && { domain: retrieval.domain }),
+        ...(retrieval.domainFilterMode && { domain_filter_mode: retrieval.domainFilterMode }),
+        ...(retrieval.filters && { filters: retrieval.filters }),
+        ...(retrieval.enableReranker !== undefined && { enable_reranker: retrieval.enableReranker }),
+        ...(retrieval.graphFilter && {
+          graph_filter: {
+            ...(retrieval.graphFilter.entities && { entities: retrieval.graphFilter.entities }),
+            ...(retrieval.graphFilter.entityType && { entity_type: retrieval.graphFilter.entityType }),
+            ...(retrieval.graphFilter.versionOf && { version_of: retrieval.graphFilter.versionOf }),
+            ...(retrieval.graphFilter.relationType && { relation_type: retrieval.graphFilter.relationType }),
+            ...(retrieval.graphFilter.fileIds && { file_ids: retrieval.graphFilter.fileIds }),
+            ...(retrieval.graphFilter.mode && { mode: retrieval.graphFilter.mode }),
+          },
+        }),
+        ...(retrieval.temporalFilter && {
+          temporal_filter: {
+            ...(retrieval.temporalFilter.asOf && { as_of: retrieval.temporalFilter.asOf }),
+            ...(retrieval.temporalFilter.since && { since: retrieval.temporalFilter.since }),
+            ...(retrieval.temporalFilter.until && { until: retrieval.temporalFilter.until }),
+            ...(retrieval.temporalFilter.recencyWeight !== undefined && { recency_weight: retrieval.temporalFilter.recencyWeight }),
+            ...(retrieval.temporalFilter.recencyDecay && { recency_decay: retrieval.temporalFilter.recencyDecay }),
+            ...(retrieval.temporalFilter.decayHalfLife !== undefined && { decay_half_life: retrieval.temporalFilter.decayHalfLife }),
+          },
+        }),
         ...(request.metadata && {
           metadata: {
             ...(request.metadata.source && { source: request.metadata.source }),
@@ -393,6 +987,8 @@ export class RagoraClient {
           },
         }),
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     const choices: ChatChoice[] = data.choices.map((c) => ({
@@ -405,6 +1001,20 @@ export class RagoraClient {
     }));
 
     const sources = this.extractChatSources(data as Record<string, unknown>);
+
+    // Parse ragora namespace (present in agentic mode)
+    let ragora: ChatResponse['ragora'];
+    if (data.ragora) {
+      ragora = {
+        citations: (data.ragora.citations ?? []).map((c) => ({
+          ref: c.ref ?? 0,
+          text: c.text,
+          source: c.source,
+          score: c.score,
+        })),
+        sessionId: data.ragora.session_id,
+      };
+    }
 
     return {
       id: data.id,
@@ -420,6 +1030,7 @@ export class RagoraClient {
           }
         : undefined,
       sources,
+      ragora,
       ...metadata,
     };
   }
@@ -427,21 +1038,31 @@ export class RagoraClient {
   /**
    * Stream a chat completion with RAG context.
    */
-  async *chatStream(request: ChatRequest): AsyncGenerator<ChatStreamChunk> {
+  async *chatStream(request: ChatRequest, options?: RequestOptions): AsyncGenerator<ChatStreamChunk> {
     const url = `${this.baseUrl}/v1/chat/completions`;
-    const collectionIds = request.collectionId
-      ? Array.isArray(request.collectionId)
-        ? request.collectionId
-        : [request.collectionId]
-      : undefined;
+    const retrieval = request.retrieval ?? {};
+    const generation = request.generation ?? {};
+    const agentic = request.agentic ?? {};
 
+    const collectionIds = await this.resolveCollectionIds({
+      collection: retrieval.collection,
+      collectionId: retrieval.collectionId,
+    });
+    const productIds = await this.resolveProductIds({
+      products: retrieval.products,
+      productIds: retrieval.productIds,
+    });
+
+    const effectiveTimeout = options?.timeout ?? this.timeout;
     const controller = new AbortController();
     // Use an inactivity timeout that resets on each chunk, not a fixed wall-clock timeout
-    let timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    let timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
     const resetTimeout = () => {
       clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
     };
+
+    this.log('Request: POST /v1/chat/completions (stream)');
 
     try {
       const response = await this.fetchFn(url, {
@@ -449,23 +1070,52 @@ export class RagoraClient {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'ragora-js/0.1.0',
+          'User-Agent': this.userAgent,
+          ...(options?.requestId && { 'X-Request-ID': options.requestId }),
         },
         body: JSON.stringify({
           ...(collectionIds && { collection_ids: collectionIds }),
-          ...(request.productIds && { product_ids: request.productIds }),
+          ...(productIds && { product_ids: productIds }),
           messages: request.messages,
-          model: request.model ?? 'gpt-4o-mini',
-          temperature: request.temperature ?? 0.7,
-          max_tokens: request.maxTokens,
-          top_k: request.topK,
+          ...(generation.model && { model: generation.model }),
+          temperature: generation.temperature ?? 0.7,
+          max_tokens: generation.maxTokens,
+          top_k: retrieval.topK,
           stream: true,
-          ...(request.sourceType && { source_type: request.sourceType }),
-          ...(request.sourceName && { source_name: request.sourceName }),
-          ...(request.version && { version: request.version }),
-          ...(request.customTags && { custom_tags: request.customTags }),
-          ...(request.filters && { filters: request.filters }),
-          ...(request.enableReranker !== undefined && { enable_reranker: request.enableReranker }),
+          ...(agentic.mode && { mode: agentic.mode }),
+          ...(agentic.systemPrompt && { system_prompt: agentic.systemPrompt }),
+          ...(agentic.session !== undefined && { session: agentic.session }),
+          ...(agentic.sessionId && { session_id: agentic.sessionId }),
+          ...(retrieval.sourceType && { source_type: retrieval.sourceType }),
+          ...(retrieval.sourceName && { source_name: retrieval.sourceName }),
+          ...(retrieval.version && { version: retrieval.version }),
+          ...(retrieval.versionMode && { version_mode: retrieval.versionMode }),
+          ...(retrieval.documentKeys && { document_keys: retrieval.documentKeys }),
+          ...(retrieval.customTags && { custom_tags: retrieval.customTags }),
+          ...(retrieval.domain && { domain: retrieval.domain }),
+          ...(retrieval.domainFilterMode && { domain_filter_mode: retrieval.domainFilterMode }),
+          ...(retrieval.filters && { filters: retrieval.filters }),
+          ...(retrieval.enableReranker !== undefined && { enable_reranker: retrieval.enableReranker }),
+          ...(retrieval.graphFilter && {
+            graph_filter: {
+              ...(retrieval.graphFilter.entities && { entities: retrieval.graphFilter.entities }),
+              ...(retrieval.graphFilter.entityType && { entity_type: retrieval.graphFilter.entityType }),
+              ...(retrieval.graphFilter.versionOf && { version_of: retrieval.graphFilter.versionOf }),
+              ...(retrieval.graphFilter.relationType && { relation_type: retrieval.graphFilter.relationType }),
+              ...(retrieval.graphFilter.fileIds && { file_ids: retrieval.graphFilter.fileIds }),
+              ...(retrieval.graphFilter.mode && { mode: retrieval.graphFilter.mode }),
+            },
+          }),
+          ...(retrieval.temporalFilter && {
+            temporal_filter: {
+              ...(retrieval.temporalFilter.asOf && { as_of: retrieval.temporalFilter.asOf }),
+              ...(retrieval.temporalFilter.since && { since: retrieval.temporalFilter.since }),
+              ...(retrieval.temporalFilter.until && { until: retrieval.temporalFilter.until }),
+              ...(retrieval.temporalFilter.recencyWeight !== undefined && { recency_weight: retrieval.temporalFilter.recencyWeight }),
+              ...(retrieval.temporalFilter.recencyDecay && { recency_decay: retrieval.temporalFilter.recencyDecay }),
+              ...(retrieval.temporalFilter.decayHalfLife !== undefined && { decay_half_life: retrieval.temporalFilter.decayHalfLife }),
+            },
+          }),
           ...(request.metadata && {
             metadata: {
               ...(request.metadata.source && { source: request.metadata.source }),
@@ -492,6 +1142,7 @@ export class RagoraClient {
       let buffer = '';
       let eventName = 'message';
       let dataLines: string[] = [];
+      let sessionId: string | undefined;
 
       const parseEvent = (
         currentEvent: string,
@@ -512,12 +1163,44 @@ export class RagoraClient {
             return { done: false };
           }
 
+          let ragoraStats: Record<string, unknown> | undefined;
+          if (RagoraClient.isRecord(parsed.ragora_stats)) {
+            ragoraStats = parsed.ragora_stats as Record<string, unknown>;
+            if (typeof ragoraStats.conversation_id === 'string') {
+              sessionId = ragoraStats.conversation_id;
+            }
+          }
+
+          if (currentEvent === 'ragora_status' || currentEvent === 'ragora.step') {
+            const stepType =
+              typeof parsed.type === 'string' ? parsed.type : 'working';
+            const stepMessage =
+              typeof parsed.status === 'string'
+                ? parsed.status
+                : typeof parsed.message === 'string'
+                  ? parsed.message
+                  : 'Working...';
+            return {
+              done: false,
+              chunk: {
+                content: '',
+                sources: [],
+                sessionId,
+                thinking: {
+                  type: stepType,
+                  message: stepMessage,
+                  timestamp: Date.now(),
+                },
+              },
+            };
+          }
+
           if (
             currentEvent === 'ragora_metadata' ||
             currentEvent === 'ragora_complete'
           ) {
             const sources = this.extractChatSources(parsed);
-            if (sources.length === 0) {
+            if (sources.length === 0 && !sessionId && currentEvent !== 'ragora_complete') {
               return { done: false };
             }
             return {
@@ -525,6 +1208,10 @@ export class RagoraClient {
               chunk: {
                 content: '',
                 sources,
+                sessionId,
+                ...(currentEvent === 'ragora_complete' && ragoraStats
+                  ? { stats: ragoraStats }
+                  : {}),
               },
             };
           }
@@ -555,6 +1242,7 @@ export class RagoraClient {
               content,
               finishReason,
               sources,
+              sessionId,
             },
           };
         } catch {
@@ -621,11 +1309,14 @@ export class RagoraClient {
   /**
    * Get current credit balance.
    */
-  async getBalance(): Promise<CreditBalance> {
+  async getBalance(options?: RequestOptions): Promise<CreditBalance> {
     const { data, metadata } = await this.request<{
       balance_usd: number;
       currency?: string;
-    }>('GET', '/v1/credits/balance');
+    }>('GET', '/v1/credits/balance', {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return {
       balanceUsd: data.balance_usd,
@@ -640,7 +1331,8 @@ export class RagoraClient {
    * List your collections.
    */
   async listCollections(
-    request?: CollectionListRequest
+    request?: CollectionListRequest,
+    options?: RequestOptions
   ): Promise<CollectionListResponse> {
     const { data, metadata } = await this.request<{
       data: Array<{
@@ -666,6 +1358,8 @@ export class RagoraClient {
         offset: request?.offset,
         search: request?.search,
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     const collections: Collection[] = data.data.map((c) => ({
@@ -695,7 +1389,7 @@ export class RagoraClient {
   /**
    * Get a specific collection by ID or slug.
    */
-  async getCollection(collectionId: string): Promise<Collection> {
+  async getCollection(collectionId: string, options?: RequestOptions): Promise<Collection> {
     const { data } = await this.request<{
       data?: {
         id: string;
@@ -721,7 +1415,10 @@ export class RagoraClient {
       total_size_bytes?: number;
       created_at?: string;
       updated_at?: string;
-    }>('GET', `/v1/collections/${collectionId}`);
+    }>('GET', `/v1/collections/${collectionId}`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     // Handle nested data structure
     const collData = data.data ?? data;
@@ -744,7 +1441,7 @@ export class RagoraClient {
   /**
    * Create a new collection.
    */
-  async createCollection(request: CreateCollectionRequest): Promise<Collection> {
+  async createCollection(request: CreateCollectionRequest, options?: RequestOptions): Promise<Collection> {
     const { data } = await this.request<{
       data?: {
         id: string;
@@ -776,6 +1473,8 @@ export class RagoraClient {
         description: request.description,
         slug: request.slug,
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     // Handle nested data structure
@@ -801,7 +1500,8 @@ export class RagoraClient {
    */
   async updateCollection(
     collectionId: string,
-    request: UpdateCollectionRequest
+    request: UpdateCollectionRequest,
+    options?: RequestOptions
   ): Promise<Collection> {
     const { data } = await this.request<{
       data?: {
@@ -835,6 +1535,8 @@ export class RagoraClient {
         slug: request.slug,
         ...(request.capabilityConfig && { capability_config: request.capabilityConfig }),
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     // Handle nested data structure
@@ -858,12 +1560,15 @@ export class RagoraClient {
   /**
    * Delete a collection and all its documents.
    */
-  async deleteCollection(collectionId: string): Promise<DeleteResponse> {
+  async deleteCollection(collectionId: string, options?: RequestOptions): Promise<DeleteResponse> {
     const { data } = await this.request<{
       message: string;
       id: string;
       deleted_at?: string;
-    }>('DELETE', `/v1/collections/${collectionId}`);
+    }>('DELETE', `/v1/collections/${collectionId}`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return {
       message: data.message ?? 'Collection deleted',
@@ -877,63 +1582,122 @@ export class RagoraClient {
   /**
    * Upload a document to a collection.
    */
-  async uploadDocument(request: UploadDocumentRequest): Promise<UploadResponse> {
-    const formData = new FormData();
-    formData.append('file', request.file, request.filename);
-    if (request.collectionId) {
-      formData.append('collection_id', request.collectionId);
-    }
+  async uploadDocument(request: UploadDocumentRequest, options?: RequestOptions): Promise<UploadResponse> {
+    const resolvedCollectionId = await this.resolveSingleCollectionId({
+      collection: request.collection,
+      collectionId: request.collectionId,
+    });
 
     const url = `${this.baseUrl}/v1/documents`;
+    const effectiveTimeout = options?.timeout ?? this.timeout;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    this.log('Request: POST /v1/documents (upload)');
 
-    try {
-      const response = await this.fetchFn(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'User-Agent': 'ragora-js/0.1.0',
-          // Note: Don't set Content-Type for FormData - browser sets it with boundary
-        },
-        body: formData,
-        signal: controller.signal,
-      });
-
-      const metadata = this.extractMetadata(response.headers);
-
-      if (!response.ok) {
-        await this.handleError(response, metadata.requestId);
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const formData = new FormData();
+      formData.append('file', request.file, request.filename);
+      if (resolvedCollectionId) {
+        formData.append('collection_id', resolvedCollectionId);
       }
+      if (request.relativePath) formData.append('relative_path', request.relativePath);
+      if (request.releaseTag) formData.append('release_tag', request.releaseTag);
+      if (request.version) formData.append('version', request.version);
+      if (request.effectiveAt) formData.append('effective_at', request.effectiveAt);
+      if (request.documentTime) formData.append('document_time', request.documentTime);
+      if (request.expiresAt) formData.append('expires_at', request.expiresAt);
+      if (request.sourceType) formData.append('source_type', request.sourceType);
+      if (request.sourceName) formData.append('source_name', request.sourceName);
+      if (request.customTags) formData.append('custom_tags', JSON.stringify(request.customTags));
+      if (request.domain) formData.append('domain', request.domain);
+      if (request.scanMode) formData.append('scan_mode', request.scanMode);
 
-      const data = (await response.json()) as {
-        id: string;
-        file_name?: string;
-        status: string;
-        collection_id: string;
-        collection_slug?: string;
-        collection_name?: string;
-        message?: string;
-      };
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
-      return {
-        id: data.id,
-        filename: data.file_name ?? request.filename,
-        status: data.status ?? 'processing',
-        collectionId: data.collection_id ?? request.collectionId ?? '',
-        message: data.message,
-        ...metadata,
-      };
-    } finally {
-      clearTimeout(timeoutId);
+      try {
+        const response = await this.fetchFn(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'User-Agent': this.userAgent,
+            ...(options?.requestId && { 'X-Request-ID': options.requestId }),
+            // Note: Don't set Content-Type for FormData - browser sets it with boundary
+          },
+          body: formData,
+          signal: controller.signal,
+        });
+
+        this.log(`Response: POST /v1/documents (upload) -> ${response.status}`);
+        const metadata = this.extractMetadata(response.headers);
+
+        if (response.ok) {
+          const data = (await response.json()) as {
+            id: string;
+            file_name?: string;
+            status: string;
+            collection_id: string;
+            collection_slug?: string;
+            collection_name?: string;
+            message?: string;
+          };
+
+          return {
+            id: data.id,
+            filename: data.file_name ?? request.filename,
+            status: data.status ?? 'processing',
+            collectionId: data.collection_id ?? resolvedCollectionId ?? '',
+            message: data.message,
+            ...metadata,
+          };
+        }
+
+        if (
+          RagoraClient.RETRYABLE_STATUS_CODES.has(response.status) &&
+          attempt < this.maxRetries
+        ) {
+          const delay = RagoraClient.retryDelay(
+            attempt,
+            RagoraClient.getRetryAfter(response.headers)
+          );
+          this.log(`Retry attempt ${attempt + 1} after ${(delay).toFixed(1)}s delay`);
+          await this.sleep(delay * 1000);
+          continue;
+        }
+
+        await this.handleError(response, metadata.requestId);
+      } finally {
+        clearTimeout(timeoutId);
+      }
     }
+
+    throw new RagoraError('upload failed', 0);
+  }
+
+  /**
+   * Upload a file from disk to a collection.
+   *
+   * Convenience wrapper around `uploadDocument()` that reads a file from the
+   * local filesystem. Only available in Node.js environments.
+   */
+  async uploadFile(
+    filePath: string,
+    request?: Omit<UploadDocumentRequest, 'file' | 'filename'>,
+    options?: RequestOptions
+  ): Promise<UploadResponse> {
+    const { readFileSync } = await import('node:fs');
+    const { basename } = await import('node:path');
+    const content = readFileSync(filePath);
+    const filename = basename(filePath);
+    return this.uploadDocument(
+      { ...request, file: new Blob([content]), filename },
+      options
+    );
   }
 
   /**
    * Get the processing status of a document.
    */
-  async getDocumentStatus(documentId: string): Promise<DocumentStatus> {
+  async getDocumentStatus(documentId: string, options?: RequestOptions): Promise<DocumentStatus> {
     const { data } = await this.request<{
       id: string;
       status: string;
@@ -948,7 +1712,10 @@ export class RagoraClient {
       is_active?: boolean;
       version_number?: number;
       created_at?: string;
-    }>('GET', `/v1/documents/${documentId}/status`);
+    }>('GET', `/v1/documents/${documentId}/status`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return {
       id: data.id ?? documentId,
@@ -970,7 +1737,12 @@ export class RagoraClient {
   /**
    * List documents in a collection.
    */
-  async listDocuments(request?: DocumentListRequest): Promise<DocumentListResponse> {
+  async listDocuments(request?: DocumentListRequest, options?: RequestOptions): Promise<DocumentListResponse> {
+    const resolvedCollectionId = await this.resolveSingleCollectionId({
+      collection: request?.collection,
+      collectionId: request?.collectionId,
+    });
+
     const { data, metadata } = await this.request<{
       data: Array<{
         id: string;
@@ -993,10 +1765,12 @@ export class RagoraClient {
       has_more: boolean;
     }>('GET', '/v1/documents', {
       params: {
-        collection_id: request?.collectionId,
+        collection_id: resolvedCollectionId,
         limit: request?.limit,
         offset: request?.offset,
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     const documents: Document[] = data.data.map((d) => ({
@@ -1028,12 +1802,15 @@ export class RagoraClient {
   /**
    * Delete a document.
    */
-  async deleteDocument(documentId: string): Promise<DeleteResponse> {
+  async deleteDocument(documentId: string, options?: RequestOptions): Promise<DeleteResponse> {
     const { data } = await this.request<{
       message: string;
       id: string;
       vectors_removed?: number;
-    }>('DELETE', `/v1/documents/${documentId}`);
+    }>('DELETE', `/v1/documents/${documentId}`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return {
       message: data.message ?? 'Document deleted',
@@ -1046,19 +1823,20 @@ export class RagoraClient {
    */
   async waitForDocument(
     documentId: string,
-    options?: {
+    waitOpts?: {
       /** Maximum time to wait in milliseconds (default: 300000 = 5 minutes) */
       timeout?: number;
       /** Time between status checks in milliseconds (default: 2000) */
       pollInterval?: number;
-    }
+    },
+    options?: RequestOptions
   ): Promise<DocumentStatus> {
-    const timeout = options?.timeout ?? 300000;
-    const pollInterval = options?.pollInterval ?? 2000;
+    const timeout = waitOpts?.timeout ?? 300000;
+    const pollInterval = waitOpts?.pollInterval ?? 2000;
     const startTime = Date.now();
 
     while (true) {
-      const status = await this.getDocumentStatus(documentId);
+      const status = await this.getDocumentStatus(documentId, options);
 
       if (status.status === 'completed') {
         return status;
@@ -1093,7 +1871,8 @@ export class RagoraClient {
    * List public marketplace products.
    */
   async listMarketplace(
-    request?: MarketplaceListRequest
+    request?: MarketplaceListRequest,
+    options?: RequestOptions
   ): Promise<MarketplaceListResponse> {
     const { data, metadata } = await this.request<{
       data: Array<{
@@ -1143,6 +1922,8 @@ export class RagoraClient {
         category: request?.category,
         trending: request?.trending ? 'true' : undefined,
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     const products: MarketplaceProduct[] = data.data.map((p) =>
@@ -1162,7 +1943,7 @@ export class RagoraClient {
   /**
    * Get a marketplace product by ID or slug.
    */
-  async getMarketplaceProduct(idOrSlug: string): Promise<MarketplaceProduct> {
+  async getMarketplaceProduct(idOrSlug: string, options?: RequestOptions): Promise<MarketplaceProduct> {
     const { data } = await this.request<{
       id: string;
       collection_id?: string;
@@ -1197,7 +1978,10 @@ export class RagoraClient {
       }>;
       created_at?: string;
       updated_at?: string;
-    }>('GET', `/v1/marketplace/${idOrSlug}`);
+    }>('GET', `/v1/marketplace/${idOrSlug}`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return this.mapMarketplaceProduct(data);
   }
@@ -1282,6 +2066,14 @@ export class RagoraClient {
   }
 
   private mapAgent(raw: Record<string, unknown>): Agent {
+    const memoryConfig = RagoraClient.isRecord(raw.memory_config) ? raw.memory_config : {};
+    const memoryRetrievalPolicy = RagoraClient.isRecord(memoryConfig.retrieval_policy)
+      ? (memoryConfig.retrieval_policy as Record<string, unknown>)
+      : undefined;
+    const topLevelRetrievalPolicy = RagoraClient.isRecord(raw.retrieval_policy)
+      ? (raw.retrieval_policy as Record<string, unknown>)
+      : undefined;
+
     return {
       id: String(raw.id ?? ''),
       orgId: String(raw.org_id ?? ''),
@@ -1289,7 +2081,8 @@ export class RagoraClient {
       type: String(raw.type ?? 'support'),
       systemPrompt: String(raw.system_prompt ?? ''),
       collectionIds: Array.isArray(raw.collection_ids) ? raw.collection_ids.map(String) : [],
-      memoryConfig: RagoraClient.isRecord(raw.memory_config) ? raw.memory_config : {},
+      memoryConfig,
+      retrievalPolicy: topLevelRetrievalPolicy ?? memoryRetrievalPolicy,
       budgetConfig: RagoraClient.isRecord(raw.budget_config) ? raw.budget_config : {},
       status: String(raw.status ?? 'active'),
       createdAt: typeof raw.created_at === 'string' ? raw.created_at : undefined,
@@ -1317,7 +2110,7 @@ export class RagoraClient {
   /**
    * Create a new agent.
    */
-  async createAgent(request: CreateAgentRequest): Promise<Agent> {
+  async createAgent(request: CreateAgentRequest, options?: RequestOptions): Promise<Agent> {
     const { data } = await this.request<Record<string, unknown>>('POST', '/v1/agents', {
       body: {
         name: request.name,
@@ -1325,8 +2118,11 @@ export class RagoraClient {
         ...(request.systemPrompt && { system_prompt: request.systemPrompt }),
         collection_ids: request.collectionIds,
         ...(request.memoryConfig && { memory_config: request.memoryConfig }),
+        ...(request.retrievalPolicy && { retrieval_policy: request.retrievalPolicy }),
         ...(request.budgetConfig && { budget_config: request.budgetConfig }),
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
     return this.mapAgent(data);
   }
@@ -1334,9 +2130,12 @@ export class RagoraClient {
   /**
    * List all agents.
    */
-  async listAgents(): Promise<AgentListResponse> {
+  async listAgents(options?: RequestOptions): Promise<AgentListResponse> {
     const { data, metadata } = await this.request<{ agents: Record<string, unknown>[] }>(
-      'GET', '/v1/agents'
+      'GET', '/v1/agents', {
+        requestId: options?.requestId,
+        timeout: options?.timeout,
+      }
     );
     return {
       agents: (data.agents ?? []).map((a) => this.mapAgent(a)),
@@ -1347,9 +2146,12 @@ export class RagoraClient {
   /**
    * Get an agent by ID.
    */
-  async getAgent(agentId: string): Promise<Agent> {
+  async getAgent(agentId: string, options?: RequestOptions): Promise<Agent> {
     const { data } = await this.request<Record<string, unknown>>(
-      'GET', `/v1/agents/${agentId}`
+      'GET', `/v1/agents/${agentId}`, {
+        requestId: options?.requestId,
+        timeout: options?.timeout,
+      }
     );
     return this.mapAgent(data);
   }
@@ -1357,17 +2159,22 @@ export class RagoraClient {
   /**
    * Update an agent.
    */
-  async updateAgent(agentId: string, request: UpdateAgentRequest): Promise<Agent> {
+  async updateAgent(agentId: string, request: UpdateAgentRequest, options?: RequestOptions): Promise<Agent> {
     const body: Record<string, unknown> = {};
     if (request.name !== undefined) body.name = request.name;
     if (request.systemPrompt !== undefined) body.system_prompt = request.systemPrompt;
     if (request.collectionIds !== undefined) body.collection_ids = request.collectionIds;
     if (request.memoryConfig !== undefined) body.memory_config = request.memoryConfig;
+    if (request.retrievalPolicy !== undefined) body.retrieval_policy = request.retrievalPolicy;
     if (request.budgetConfig !== undefined) body.budget_config = request.budgetConfig;
     if (request.status !== undefined) body.status = request.status;
 
     const { data } = await this.request<Record<string, unknown>>(
-      'PATCH', `/v1/agents/${agentId}`, { body }
+      'PATCH', `/v1/agents/${agentId}`, {
+        body,
+        requestId: options?.requestId,
+        timeout: options?.timeout,
+      }
     );
     return this.mapAgent(data);
   }
@@ -1375,9 +2182,12 @@ export class RagoraClient {
   /**
    * Delete an agent.
    */
-  async deleteAgent(agentId: string): Promise<DeleteResponse> {
+  async deleteAgent(agentId: string, options?: RequestOptions): Promise<DeleteResponse> {
     const { data } = await this.request<{ message: string; id?: string }>(
-      'DELETE', `/v1/agents/${agentId}`
+      'DELETE', `/v1/agents/${agentId}`, {
+        requestId: options?.requestId,
+        timeout: options?.timeout,
+      }
     );
     return {
       message: data.message ?? 'Agent deleted',
@@ -1388,7 +2198,7 @@ export class RagoraClient {
   /**
    * Chat with an agent.
    */
-  async agentChat(agentId: string, request: AgentChatRequest): Promise<AgentChatResponse> {
+  async agentChat(agentId: string, request: AgentChatRequest, options?: RequestOptions): Promise<AgentChatResponse> {
     const { data, metadata } = await this.request<{
       message: string;
       session_id: string;
@@ -1398,8 +2208,11 @@ export class RagoraClient {
       body: {
         message: request.message,
         ...(request.sessionId && { session_id: request.sessionId }),
+        ...(request.collectionIds && { collection_ids: request.collectionIds }),
         stream: false,
       },
+      requestId: options?.requestId,
+      timeout: options?.timeout,
     });
 
     return {
@@ -1416,17 +2229,21 @@ export class RagoraClient {
    */
   async *agentChatStream(
     agentId: string,
-    request: AgentChatRequest
+    request: AgentChatRequest,
+    options?: RequestOptions
   ): AsyncGenerator<AgentChatStreamChunk> {
     const url = `${this.baseUrl}/v1/agents/${agentId}/chat`;
+    const effectiveTimeout = options?.timeout ?? this.timeout;
 
     const controller = new AbortController();
     // Use an inactivity timeout that resets on each chunk, not a fixed wall-clock timeout
-    let timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    let timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
     const resetTimeout = () => {
       clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
     };
+
+    this.log(`Request: POST /v1/agents/${agentId}/chat (stream)`);
 
     try {
       const response = await this.fetchFn(url, {
@@ -1434,11 +2251,13 @@ export class RagoraClient {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'ragora-js/0.1.0',
+          'User-Agent': this.userAgent,
+          ...(options?.requestId && { 'X-Request-ID': options.requestId }),
         },
         body: JSON.stringify({
           message: request.message,
           ...(request.sessionId && { session_id: request.sessionId }),
+          ...(request.collectionIds && { collection_ids: request.collectionIds }),
           stream: true,
         }),
         signal: controller.signal,
@@ -1486,18 +2305,47 @@ export class RagoraClient {
               try {
                 const parsed = JSON.parse(dataStr) as Record<string, unknown>;
 
-                if (eventName === 'ragora_metadata' || eventName === 'ragora_status') {
+                if (eventName === 'ragora_status') {
+                  // Extract session ID if present
                   if (RagoraClient.isRecord(parsed.ragora_stats)) {
-                    const stats = parsed.ragora_stats as Record<string, unknown>;
-                    if (typeof stats.conversation_id === 'string') {
-                      sessionId = stats.conversation_id;
+                    const rstats = parsed.ragora_stats as Record<string, unknown>;
+                    if (typeof rstats.conversation_id === 'string') {
+                      sessionId = rstats.conversation_id;
+                    }
+                  }
+                  // Yield thinking step
+                  const stepType =
+                    typeof parsed.type === 'string' ? parsed.type : 'working';
+                  const stepMessage =
+                    typeof parsed.status === 'string'
+                      ? parsed.status
+                      : typeof parsed.message === 'string'
+                        ? parsed.message
+                        : 'Working...';
+                  yield {
+                    content: '',
+                    sessionId,
+                    sources: [],
+                    thinking: {
+                      type: stepType,
+                      message: stepMessage,
+                      timestamp: Date.now(),
+                    },
+                    done: false,
+                  };
+                } else if (eventName === 'ragora_metadata') {
+                  if (RagoraClient.isRecord(parsed.ragora_stats)) {
+                    const rstats = parsed.ragora_stats as Record<string, unknown>;
+                    if (typeof rstats.conversation_id === 'string') {
+                      sessionId = rstats.conversation_id;
                     }
                   }
                 } else if (eventName === 'ragora_complete') {
                   const stats = RagoraClient.isRecord(parsed.ragora_stats)
                     ? (parsed.ragora_stats as Record<string, unknown>)
                     : undefined;
-                  yield { content: '', sessionId, stats, done: true };
+                  const sources = this.extractChatSources(parsed);
+                  yield { content: '', sessionId, sources, stats, done: true };
                 } else {
                   // Content chunk
                   const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
@@ -1508,7 +2356,7 @@ export class RagoraClient {
                     : {};
                   const content = typeof delta.content === 'string' ? delta.content : '';
                   if (content) {
-                    yield { content, sessionId, done: false };
+                    yield { content, sessionId, sources: [], done: false };
                   }
                 }
               } catch {
@@ -1537,11 +2385,14 @@ export class RagoraClient {
   /**
    * List sessions for an agent.
    */
-  async listAgentSessions(agentId: string): Promise<AgentSessionListResponse> {
+  async listAgentSessions(agentId: string, options?: RequestOptions): Promise<AgentSessionListResponse> {
     const { data, metadata } = await this.request<{
       sessions: Record<string, unknown>[];
       total: number;
-    }>('GET', `/v1/agents/${agentId}/sessions`);
+    }>('GET', `/v1/agents/${agentId}/sessions`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     return {
       sessions: (data.sessions ?? []).map((s) => this.mapAgentSession(s)),
@@ -1555,12 +2406,16 @@ export class RagoraClient {
    */
   async getAgentSession(
     agentId: string,
-    sessionId: string
+    sessionId: string,
+    options?: RequestOptions
   ): Promise<AgentSessionDetailResponse> {
     const { data, metadata } = await this.request<{
       session: Record<string, unknown>;
       messages: Record<string, unknown>[];
-    }>('GET', `/v1/agents/${agentId}/sessions/${sessionId}`);
+    }>('GET', `/v1/agents/${agentId}/sessions/${sessionId}`, {
+      requestId: options?.requestId,
+      timeout: options?.timeout,
+    });
 
     const messages: AgentMessage[] = (data.messages ?? []).map((m) => ({
       id: String(m.id ?? ''),
@@ -1585,14 +2440,86 @@ export class RagoraClient {
    */
   async deleteAgentSession(
     agentId: string,
-    sessionId: string
+    sessionId: string,
+    options?: RequestOptions
   ): Promise<DeleteResponse> {
     const { data } = await this.request<{ status: string }>(
-      'DELETE', `/v1/agents/${agentId}/sessions/${sessionId}`
+      'DELETE', `/v1/agents/${agentId}/sessions/${sessionId}`, {
+        requestId: options?.requestId,
+        timeout: options?.timeout,
+      }
     );
     return {
       message: data.status ?? 'resolved',
       id: sessionId,
     };
+  }
+
+  // --- Auto-Pagination Iterators ---
+
+  /**
+   * Iterate over all collections, automatically handling pagination.
+   */
+  async *listCollectionsIter(
+    request?: Omit<CollectionListRequest, 'offset'>,
+    options?: RequestOptions
+  ): AsyncGenerator<Collection> {
+    const limit = request?.limit ?? 20;
+    let offset = 0;
+    while (true) {
+      const page = await this.listCollections(
+        { ...request, limit, offset },
+        options
+      );
+      for (const item of page.data) {
+        yield item;
+      }
+      if (!page.hasMore) break;
+      offset += page.limit;
+    }
+  }
+
+  /**
+   * Iterate over all documents, automatically handling pagination.
+   */
+  async *listDocumentsIter(
+    request?: Omit<DocumentListRequest, 'offset'>,
+    options?: RequestOptions
+  ): AsyncGenerator<Document> {
+    const limit = request?.limit ?? 50;
+    let offset = 0;
+    while (true) {
+      const page = await this.listDocuments(
+        { ...request, limit, offset },
+        options
+      );
+      for (const item of page.data) {
+        yield item;
+      }
+      if (!page.hasMore) break;
+      offset += page.limit;
+    }
+  }
+
+  /**
+   * Iterate over all marketplace products, automatically handling pagination.
+   */
+  async *listMarketplaceIter(
+    request?: Omit<MarketplaceListRequest, 'offset'>,
+    options?: RequestOptions
+  ): AsyncGenerator<MarketplaceProduct> {
+    const limit = request?.limit ?? 20;
+    let offset = 0;
+    while (true) {
+      const page = await this.listMarketplace(
+        { ...request, limit, offset },
+        options
+      );
+      for (const item of page.data) {
+        yield item;
+      }
+      if (!page.hasMore) break;
+      offset += page.limit;
+    }
   }
 }

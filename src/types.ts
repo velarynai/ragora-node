@@ -23,15 +23,39 @@ export interface ResponseMetadata {
 
 // --- Search Types ---
 
-export interface SearchRequest {
-  /** Collection ID or slug (single or array). Omit to search all accessible collections. */
-  collectionId?: string | string[];
-  /** Search query */
-  query: string;
-  /** Number of results to return (default: 5) */
+export interface RetrievalGraphFilter {
+  /** Entity names to filter by (AND logic) */
+  entities?: string[];
+  /** Entity type to restrict (e.g., "PERSON", "ORG", "api_function") */
+  entityType?: string;
+  /** Find versions of this file ID */
+  versionOf?: string;
+  /** Filter by relationship type (SUPERSEDES, CITES, etc.) */
+  relationType?: string;
+  /** Specific file IDs to search within */
+  fileIds?: string[];
+  /** Graph prefilter mode: "strict" or "fallback" */
+  mode?: string;
+}
+
+export interface RetrievalTemporalFilter {
+  /** Point-in-time snapshot */
+  asOf?: string;
+  /** Start of time range */
+  since?: string;
+  /** End of time range */
+  until?: string;
+  /** Recency weight (0-1) */
+  recencyWeight?: number;
+  /** Decay function: "exponential" or "linear" */
+  recencyDecay?: string;
+  /** Half-life in days for decay */
+  decayHalfLife?: number;
+}
+
+export interface RetrievalOptions {
+  /** Number of chunks to retrieve for context (default: 5) */
   topK?: number;
-  /** Minimum relevance score (0-1) */
-  threshold?: number;
   /** Metadata filters (MongoDB-style operators: $gt, $gte, $lt, $lte, $in, $ne) */
   filters?: Record<string, unknown>;
   /** Filter by source type (e.g., ["upload", "html", "youtube"]) */
@@ -40,40 +64,31 @@ export interface SearchRequest {
   sourceName?: string[];
   /** Filter by document version tags */
   version?: string[];
-  /** Version mode: "latest" or "all" */
+  /** Version mode: "latest", "all", or "exact" */
   versionMode?: string;
   /** Filter by specific document keys */
   documentKeys?: string[];
   /** Filter by custom tags (OR logic) */
   customTags?: string[];
-  /** Filter by domain (e.g., ["legal", "medical", "software_docs"]) */
+  /** Filter by domain (e.g., ["legal", "medical", "financial"]) */
   domain?: string[];
   /** Domain filter mode: "preferred" (boost, default) or "strict" (filter) */
   domainFilterMode?: string;
-  /** Toggle reranker for result refinement (default: false) */
+  /** Toggle reranker for result refinement */
   enableReranker?: boolean;
   /** Knowledge graph filter for entity-based pre-filtering */
-  graphFilter?: {
-    /** Entity names to filter by (AND logic) */
-    entities?: string[];
-    /** Entity type to restrict (e.g., "PERSON", "ORG", "api_function") */
-    entityType?: string;
-  };
+  graphFilter?: RetrievalGraphFilter;
   /** Temporal filter for time-based result weighting */
-  temporalFilter?: {
-    /** Point-in-time snapshot */
-    asOf?: string;
-    /** Start of time range */
-    since?: string;
-    /** End of time range */
-    until?: string;
-    /** Recency weight (0-1) */
-    recencyWeight?: number;
-    /** Decay function: "exponential" or "linear" */
-    recencyDecay?: string;
-    /** Half-life in days for decay */
-    decayHalfLife?: number;
-  };
+  temporalFilter?: RetrievalTemporalFilter;
+}
+
+export interface SearchRequest extends RetrievalOptions {
+  /** Collection UUID/slug/name (single or array). Omit to search all accessible collections. */
+  collection?: string | string[];
+  /** Collection IDs/slugs (single or array). Legacy parameter. */
+  collectionId?: string | string[];
+  /** Search query */
+  query: string;
 }
 
 export interface SearchResult {
@@ -83,6 +98,8 @@ export interface SearchResult {
   content: string;
   /** Relevance score (0-1) */
   score: number;
+  /** Source URL (primary source link when available, e.g. web page URL, GitHub file URL) */
+  sourceUrl?: string;
   /** Document metadata */
   metadata: Record<string, unknown>;
   /** Parent document ID */
@@ -123,44 +140,59 @@ export interface ChatMessage {
   content: string;
 }
 
-export interface ChatRequest {
-  /** Collection ID or slug (single or array). Omit to use all accessible collections. */
-  collectionId?: string | string[];
-  /** Product IDs to search */
-  productIds?: string[];
-  /** Chat messages */
-  messages: ChatMessage[];
-  /** Model to use via OpenRouter (e.g., "openai/gpt-4o-mini", "anthropic/claude-4-5-sonnet") */
+export interface ChatGenerationOptions {
+  /** Model to use via OpenRouter (e.g., "google/gemini-2.5-flash", "anthropic/claude-4-5-sonnet") */
   model?: string;
   /** Sampling temperature (0-2) */
   temperature?: number;
   /** Maximum tokens to generate */
   maxTokens?: number;
-  /** Number of chunks to retrieve for context (default: 5, max: 20) */
-  topK?: number;
-  /** Filter by source type */
-  sourceType?: string[];
-  /** Filter by source name */
-  sourceName?: string[];
-  /** Filter by document version */
-  version?: string[];
-  /** Filter by custom tags */
-  customTags?: string[];
-  /** Metadata filters (MongoDB-style operators) */
-  filters?: Record<string, unknown>;
-  /** Toggle reranker for result refinement (default: false) */
-  enableReranker?: boolean;
+}
+
+export interface ChatRetrievalOptions extends RetrievalOptions {
+  /** Collection UUID/slug/name (single or array). */
+  collection?: string | string[];
+  /** Collection IDs/slugs (single or array). Legacy parameter. */
+  collectionId?: string | string[];
+  /** Product UUID/slug/title (single or array). */
+  products?: string | string[];
+  /** Product IDs to search. Legacy parameter. */
+  productIds?: string[];
+}
+
+export interface ChatAgenticOptions {
+  /** Chat mode: "simple" (default) uses single retrieval, "agentic" uses multi-step agent */
+  mode?: 'simple' | 'agentic';
+  /** System prompt override (used with agentic mode) */
+  systemPrompt?: string;
+  /** Whether to enable stateful session memory. Defaults to false. */
+  session?: boolean;
+  /** Session ID for multi-turn agentic chat. Reuse to continue a conversation. */
+  sessionId?: string;
+}
+
+export interface ChatMetadataOptions {
+  /** Request source: "web", "api", "discord_bot", "slack_bot" */
+  source?: string;
+  /** Bot installation ID */
+  installationId?: string;
+  /** Chat channel ID */
+  channelId?: string;
+  /** User who triggered the request */
+  requesterId?: string;
+}
+
+export interface ChatRequest {
+  /** Chat messages */
+  messages: ChatMessage[];
+  /** Generation options */
+  generation?: ChatGenerationOptions;
+  /** Retrieval options */
+  retrieval?: ChatRetrievalOptions;
+  /** Agentic/session options */
+  agentic?: ChatAgenticOptions;
   /** Request metadata for analytics tracking */
-  metadata?: {
-    /** Request source: "web", "api", "discord_bot", "slack_bot" */
-    source?: string;
-    /** Bot installation ID */
-    installationId?: string;
-    /** Chat channel ID */
-    channelId?: string;
-    /** User who triggered the request */
-    requesterId?: string;
-  };
+  metadata?: ChatMetadataOptions;
 }
 
 export interface ChatChoice {
@@ -181,6 +213,17 @@ export interface ChatUsage {
   totalTokens: number;
 }
 
+export interface RagoraCitation {
+  /** Reference number (1-indexed) */
+  ref: number;
+  /** Citation text snippet */
+  text?: string;
+  /** Source filename or URL */
+  source?: string;
+  /** Relevance score */
+  score?: number;
+}
+
 export interface ChatResponse extends ResponseMetadata {
   /** Completion ID */
   id: string;
@@ -196,6 +239,23 @@ export interface ChatResponse extends ResponseMetadata {
   usage?: ChatUsage;
   /** Source documents used for RAG (flattened from ragora_stats.sources) */
   sources: SearchResult[];
+  /** Ragora-specific metadata (present in agentic mode) */
+  ragora?: {
+    /** Structured citations from agent retrieval */
+    citations: RagoraCitation[];
+    /** Session ID for multi-turn agentic chat */
+    sessionId?: string;
+  };
+}
+
+/** A real-time status update emitted while the agent is working. */
+export interface ThinkingStep {
+  /** Step category: "thinking", "searching", "found", "generating", "working", "warning" */
+  type: string;
+  /** Human-readable description of what the agent is doing */
+  message: string;
+  /** Unix-ms timestamp */
+  timestamp: number;
 }
 
 export interface ChatStreamChunk {
@@ -203,8 +263,14 @@ export interface ChatStreamChunk {
   content: string;
   /** Why generation stopped */
   finishReason?: string;
+  /** Session ID for stateful chat streams */
+  sessionId?: string;
   /** Sources from Ragora SSE metadata events */
   sources: SearchResult[];
+  /** Final stats payload (present on ragora_complete) */
+  stats?: Record<string, unknown>;
+  /** Thinking step (present when the agent emits a status update) */
+  thinking?: ThinkingStep;
 }
 
 // --- Credit Types ---
@@ -348,7 +414,9 @@ export interface DocumentStatus {
 }
 
 export interface DocumentListRequest {
-  /** Collection ID or slug (lists all if not provided) */
+  /** Collection UUID/slug/name */
+  collection?: string;
+  /** Collection ID or slug (legacy parameter) */
   collectionId?: string;
   /** Number of results per page (max 200) */
   limit?: number;
@@ -374,8 +442,32 @@ export interface UploadDocumentRequest {
   file: Blob | Buffer;
   /** Original filename */
   filename: string;
-  /** Target collection ID or slug (uses default if not provided) */
+  /** Target collection UUID/slug/name */
+  collection?: string;
+  /** Target collection ID or slug (legacy parameter) */
   collectionId?: string;
+  /** Relative path for directory-style uploads */
+  relativePath?: string;
+  /** Release tag for versioned documents */
+  releaseTag?: string;
+  /** Document version string */
+  version?: string;
+  /** When the document becomes effective (ISO 8601) */
+  effectiveAt?: string;
+  /** Document timestamp for temporal search (ISO 8601) */
+  documentTime?: string;
+  /** When the document expires (ISO 8601) */
+  expiresAt?: string;
+  /** Source type (e.g., "sec_filing", "web_crawl") */
+  sourceType?: string;
+  /** Source name (e.g., "sec-edgar") */
+  sourceName?: string;
+  /** Custom tags for filtering (JSON-encoded in FormData) */
+  customTags?: string[];
+  /** Content domain (e.g., "legal", "medical", "financial") */
+  domain?: string;
+  /** Scan mode for PDFs: "fast" or "hi_res" */
+  scanMode?: string;
 }
 
 export interface UploadResponse extends ResponseMetadata {
@@ -515,6 +607,8 @@ export interface Agent {
   collectionIds: string[];
   /** Memory configuration */
   memoryConfig: Record<string, unknown>;
+  /** Retrieval policy used by agent auto-retrieval */
+  retrievalPolicy?: Record<string, unknown>;
   /** Budget configuration */
   budgetConfig: Record<string, unknown>;
   /** Agent status */
@@ -536,6 +630,8 @@ export interface CreateAgentRequest {
   collectionIds: string[];
   /** Memory configuration */
   memoryConfig?: Record<string, unknown>;
+  /** Auto-retrieval policy constraints/defaults for agent tool calls */
+  retrievalPolicy?: Record<string, unknown>;
   /** Budget configuration */
   budgetConfig?: Record<string, unknown>;
 }
@@ -549,6 +645,8 @@ export interface UpdateAgentRequest {
   collectionIds?: string[];
   /** New memory config */
   memoryConfig?: Record<string, unknown>;
+  /** New auto-retrieval policy */
+  retrievalPolicy?: Record<string, unknown>;
   /** New budget config */
   budgetConfig?: Record<string, unknown>;
   /** New status */
@@ -565,6 +663,8 @@ export interface AgentChatRequest {
   message: string;
   /** Session ID to continue a conversation */
   sessionId?: string;
+  /** Optional collection scope override for this session/chat turn */
+  collectionIds?: string[];
 }
 
 export interface AgentChatResponse extends ResponseMetadata {
@@ -583,8 +683,12 @@ export interface AgentChatStreamChunk {
   content: string;
   /** Session ID (available from first metadata event) */
   sessionId?: string;
+  /** Sources retrieved from Ragora (available on final chunk when done=true) */
+  sources: SearchResult[];
   /** Final stats (only on last chunk when done=true) */
   stats?: Record<string, unknown>;
+  /** Thinking step (present when the agent emits a status update) */
+  thinking?: ThinkingStep;
   /** Whether stream is complete */
   done: boolean;
 }
@@ -663,4 +767,13 @@ export interface APIError {
   details: APIErrorDetail[];
   /** Request ID for debugging */
   requestId?: string;
+}
+
+// --- Request Options ---
+
+export interface RequestOptions {
+  /** Custom request ID (sent as X-Request-ID header) */
+  requestId?: string;
+  /** Per-request timeout in milliseconds (overrides client-level timeout) */
+  timeout?: number;
 }

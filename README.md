@@ -58,8 +58,8 @@ results.results.forEach((result) => {
 
 // Chat with your knowledge base
 const response = await client.chat({
-  collectionId: collection.id,
   messages: [{ role: 'user', content: 'Summarize the main concepts' }],
+  retrieval: { collectionId: collection.id },
 });
 console.log(response.choices[0].message.content);
 ```
@@ -172,8 +172,11 @@ const results = await client.search({
   collectionId: 'collection-id',
   query: 'What is machine learning?',
   topK: 5, // number of results
-  threshold: 0.7, // minimum relevance score (0-1)
-  filter: { type: 'doc' }, // optional metadata filter
+  sourceType: ['sec_filing'],
+  customTags: ['ticker:aapl', 'form:10-k'],
+  filters: { filing_year: { $gte: 2023 } },
+  versionMode: 'latest',
+  enableReranker: true,
 });
 
 for (const result of results.results) {
@@ -189,15 +192,23 @@ for (const result of results.results) {
 ```typescript
 // Non-streaming
 const response = await client.chat({
-  collectionId: 'collection-id',
   messages: [
     { role: 'system', content: 'You are a helpful assistant.' },
     { role: 'user', content: 'Explain RAG' },
   ],
-  model: 'gpt-4o-mini', // optional
-  temperature: 0.7, // optional
-  maxTokens: 1000, // optional
-  systemPrompt: 'Custom system prompt', // optional
+  generation: {
+    model: 'gpt-4o-mini',
+    temperature: 0.7,
+    maxTokens: 1000,
+  },
+  retrieval: {
+    collectionId: 'collection-id',
+    versionMode: 'latest',
+    documentKeys: ['sec:10k:0000320193'],
+    domain: ['financial'],
+    domainFilterMode: 'strict',
+    enableReranker: true,
+  },
 });
 
 console.log(response.choices[0].message.content);
@@ -205,8 +216,8 @@ console.log(`Sources used: ${response.sources.length}`);
 
 // Streaming
 for await (const chunk of client.chatStream({
-  collectionId: 'collection-id',
   messages: [{ role: 'user', content: 'Explain RAG' }],
+  retrieval: { collectionId: 'collection-id' },
 })) {
   process.stdout.write(chunk.content);
 
@@ -215,6 +226,77 @@ for await (const chunk of client.chatStream({
     console.log(`\n\nSources: ${chunk.sources.length}`);
   }
 }
+```
+
+`chat()` and `chatStream()` use grouped options:
+- `generation`: model/temperature/maxTokens
+- `retrieval`: collection/product scope + retrieval filters
+- `agentic`: mode/systemPrompt/session/sessionId
+- `metadata`: source attribution fields
+
+## Friendly Collection/Product References
+
+You can now pass human-friendly names directly:
+
+- `collection`: collection UUID, slug, or name
+- `products`: product UUID, slug, or title
+
+Legacy fields still work:
+
+- `collectionId`
+- `productIds`
+
+Do not pass both new and legacy fields in the same call.
+
+```typescript
+// Search by collection name
+const search = await client.search({
+  collection: 'SEC Filings',
+  query: 'gross margin',
+});
+
+// Chat by product title/slug
+const chat = await client.chat({
+  messages: [{ role: 'user', content: 'Summarize key risks' }],
+  retrieval: { products: ['Apple 10-K Pack'] },
+});
+
+// Upload/list docs by collection name
+await client.uploadDocument({
+  file: new Blob(['hello']),
+  filename: 'hello.txt',
+  collection: 'Internal Docs',
+});
+
+const docs = await client.listDocuments({ collection: 'Internal Docs' });
+```
+
+The same retrieval controls (`sourceType`, `sourceName`, `version`, `versionMode`, `documentKeys`, `customTags`, `domain`, `domainFilterMode`, `filters`, `graphFilter`, `temporalFilter`, `enableReranker`) are available across `search` and `chat`.
+
+### Agent Chat (Auto Retrieval)
+
+```typescript
+const agent = await client.createAgent({
+  name: 'SEC Analyst',
+  collectionIds: ['collection-id'],
+  retrievalPolicy: {
+    default_top_k: 8,
+    max_top_k: 15,
+    constraints: {
+      domain: ['financial'],
+      domain_filter_mode: 'strict',
+      custom_tags: ['ticker:aapl'],
+    },
+  },
+});
+
+const reply = await client.agentChat(agent.id, {
+  message: 'Summarize 2024 gross margin drivers for AAPL',
+  sessionId: 'optional-session-id',
+  collectionIds: ['collection-id'], // optional session-level collection scope
+});
+
+console.log(reply.message);
 ```
 
 ### Marketplace
@@ -261,28 +343,37 @@ console.log(`Rate limit resets in: ${response.rateLimitReset}s`);
 ## Error Handling
 
 ```typescript
-import { RagoraClient, RagoraError } from 'ragora';
+import {
+  RagoraClient,
+  RagoraError,
+  AuthenticationError,
+  NotFoundError,
+  RateLimitError,
+  ServerError,
+} from 'ragora';
 
 const client = new RagoraClient({ apiKey: 'your-api-key' });
 
 try {
   const results = await client.search({...});
 } catch (error) {
-  if (error instanceof RagoraError) {
+  if (error instanceof AuthenticationError) {
+    console.log('Check your API key');
+  } else if (error instanceof RateLimitError) {
+    console.log(`Rate limited - retry after ${error.retryAfter}s`);
+  } else if (error instanceof NotFoundError) {
+    console.log('Resource not found');
+  } else if (error instanceof ServerError) {
+    console.log('Server error - safe to retry');
+  } else if (error instanceof RagoraError) {
     console.log(`Error: ${error.message}`);
     console.log(`Status code: ${error.statusCode}`);
     console.log(`Request ID: ${error.requestId}`);
-
-    if (error.isRateLimited) {
-      console.log('Rate limited - wait and retry');
-    } else if (error.isAuthError) {
-      console.log('Check your API key');
-    } else if (error.isRetryable) {
-      console.log('Temporary error - safe to retry');
-    }
   }
 }
 ```
+
+The SDK also retries 429 and 5xx errors automatically (configurable via `maxRetries`, default: 2).
 
 ## Next.js Integration
 
@@ -327,8 +418,8 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       for await (const chunk of client.chatStream({
-        collectionId,
         messages,
+        retrieval: { collectionId },
       })) {
         controller.enqueue(encoder.encode(chunk.content));
       }
@@ -357,8 +448,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const { messages, collectionId } = req.body;
 
   const response = await client.chat({
-    collectionId,
     messages,
+    retrieval: { collectionId },
   });
 
   res.status(200).json(response);
@@ -378,6 +469,8 @@ See the [`examples/`](examples/) directory for complete, runnable examples:
 | [Documents](examples/documents.ts) | Upload, process, list, delete documents | `npm run example:documents` |
 | [Marketplace](examples/marketplace.ts) | Browse marketplace products and listings | `npm run example:marketplace` |
 | [Credits](examples/credits.ts) | Check balance and track costs | `npm run example:credits` |
+| [Agentic RAG](examples/agentic-rag/chat.ts) | Multi-turn agent chat with auto retrieval | `npm run example:agentic-rag` |
+| [Next.js Integration](examples/nextjs-integration.ts) | App Router search, chat, and streaming handlers | `npm run example:nextjs` |
 
 Set your API key before running:
 

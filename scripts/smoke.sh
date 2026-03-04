@@ -7,6 +7,9 @@ npm run typecheck
 echo "==> Build"
 npm run build
 
+echo "==> Unit tests"
+npm test
+
 echo "==> Package dry run"
 npm pack --dry-run --cache /tmp/npm-cache
 

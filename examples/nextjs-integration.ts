@@ -37,8 +37,8 @@ export async function chatHandler(request: Request) {
   };
 
   const response = await client.chat({
-    collectionId,
     messages,
+    retrieval: { collectionId },
   });
 
   return Response.json(response);
@@ -58,8 +58,8 @@ export async function streamingChatHandler(request: Request) {
     async start(controller) {
       try {
         for await (const chunk of client.chatStream({
-          collectionId,
           messages,
+          retrieval: { collectionId },
         })) {
           // Send as Server-Sent Events format
           const data = JSON.stringify(chunk);

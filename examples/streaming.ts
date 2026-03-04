@@ -24,15 +24,14 @@ async function main() {
   let sources: typeof chunk.sources = [];
 
   for await (const chunk of client.chatStream({
-    collectionId,
     messages: [
       {
         role: 'user',
         content: 'Explain the benefits of using RAG over fine-tuning',
       },
     ],
-    model: 'gpt-4o-mini',
-    temperature: 0.7,
+    retrieval: { collectionId },
+    generation: { temperature: 0.7 },
   })) {
     process.stdout.write(chunk.content);
 

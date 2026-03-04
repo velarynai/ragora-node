@@ -7,16 +7,25 @@
 export { RagoraClient, type RagoraClientOptions } from './client.js';
 export type {
   // Search
+  RetrievalOptions,
+  RetrievalGraphFilter,
+  RetrievalTemporalFilter,
   SearchRequest,
   SearchResult,
   SearchResponse,
   // Chat
   ChatMessage,
+  ChatGenerationOptions,
+  ChatRetrievalOptions,
+  ChatAgenticOptions,
+  ChatMetadataOptions,
   ChatRequest,
   ChatChoice,
   ChatResponse,
   ChatStreamChunk,
   ChatUsage,
+  RagoraCitation,
+  ThinkingStep,
   // Credits
   CreditBalance,
   // Collections
@@ -55,5 +64,7 @@ export type {
   APIErrorDetail,
   // Metadata
   ResponseMetadata,
+  // Request Options
+  RequestOptions,
 } from './types.js';
-export { RagoraError } from './errors.js';
+export { RagoraError, AuthenticationError, AuthorizationError, NotFoundError, RateLimitError, ServerError } from './errors.js';

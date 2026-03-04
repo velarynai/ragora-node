@@ -20,10 +20,9 @@ async function main() {
   console.log('=== Chat Completion ===\n');
 
   const response = await client.chat({
-    collectionId,
     messages: [{ role: 'user', content: 'What is RAG and how does it work?' }],
-    model: 'gpt-4o-mini',
-    temperature: 0.7,
+    retrieval: { collectionId },
+    generation: { temperature: 0.7 },
   });
 
   console.log(`Assistant: ${response.choices[0].message.content}\n`);

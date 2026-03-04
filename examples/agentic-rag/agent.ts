@@ -12,7 +12,6 @@
  */
 
 import { RagoraClient } from '../../src/index.js';
-import type { AgentChatStreamChunk } from '../../src/types.js';
 
 export interface CreateAgentOptions {
   /** Collection ID to link (required when creating a new agent) */
@@ -29,6 +28,10 @@ export interface CreateAgentOptions {
   baseUrl?: string;
   /** Existing agent ID to connect to */
   agentId?: string;
+  /** Auto-retrieval policy applied by the agent service */
+  retrievalPolicy?: Record<string, unknown>;
+  /** Optional collection scope used for session-level agent chat */
+  sessionCollectionIds?: string[];
 }
 
 export interface ChatResult {
@@ -49,11 +52,18 @@ export class AgenticRAGAgent {
   readonly client: RagoraClient;
   readonly agentId: string;
   sessionId: string | undefined;
+  private readonly sessionCollectionIds: string[] | undefined;
 
-  constructor(client: RagoraClient, agentId: string, sessionId?: string) {
+  constructor(
+    client: RagoraClient,
+    agentId: string,
+    sessionId?: string,
+    sessionCollectionIds?: string[],
+  ) {
     this.client = client;
     this.agentId = agentId;
     this.sessionId = sessionId;
+    this.sessionCollectionIds = sessionCollectionIds;
   }
 
   /**
@@ -80,7 +90,12 @@ export class AgenticRAGAgent {
 
     if (options.agentId) {
       await client.getAgent(options.agentId);
-      return new AgenticRAGAgent(client, options.agentId);
+      return new AgenticRAGAgent(
+        client,
+        options.agentId,
+        undefined,
+        options.sessionCollectionIds,
+      );
     }
 
     if (!options.collectionId) {
@@ -91,10 +106,16 @@ export class AgenticRAGAgent {
       name: options.name ?? 'RAG Agent',
       collectionIds: [options.collectionId],
       systemPrompt: options.systemPrompt,
+      retrievalPolicy: options.retrievalPolicy,
       budgetConfig: options.budgetConfig,
     });
 
-    return new AgenticRAGAgent(client, agent.id);
+    return new AgenticRAGAgent(
+      client,
+      agent.id,
+      undefined,
+      options.sessionCollectionIds,
+    );
   }
 
   /**
@@ -105,6 +126,7 @@ export class AgenticRAGAgent {
     const response = await this.client.agentChat(this.agentId, {
       message,
       sessionId: this.sessionId,
+      ...(this.sessionCollectionIds && { collectionIds: this.sessionCollectionIds }),
     });
 
     if (response.sessionId) {
@@ -127,6 +149,7 @@ export class AgenticRAGAgent {
     const stream = this.client.agentChatStream(this.agentId, {
       message,
       sessionId: this.sessionId,
+      ...(this.sessionCollectionIds && { collectionIds: this.sessionCollectionIds }),
     });
 
     for await (const chunk of stream) {
