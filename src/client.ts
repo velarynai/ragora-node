@@ -371,6 +371,14 @@ export class RagoraClient {
         typeof raw.document_id === 'string' ? raw.document_id : undefined,
       collectionId:
         typeof raw.collection_id === 'string' ? raw.collection_id : undefined,
+      pageNumber:
+        typeof raw.page_number === 'number' ? raw.page_number
+        : typeof metadata.page_number === 'number' ? metadata.page_number as number
+        : undefined,
+      sectionHeading:
+        typeof raw.section_heading === 'string' ? raw.section_heading
+        : typeof metadata.section_heading === 'string' ? metadata.section_heading as string
+        : undefined,
     };
   }
 

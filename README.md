@@ -197,7 +197,7 @@ const response = await client.chat({
     { role: 'user', content: 'Explain RAG' },
   ],
   generation: {
-    model: 'gpt-4o-mini',
+    model: 'google/gemini-2.5-flash',
     temperature: 0.7,
     maxTokens: 1000,
   },

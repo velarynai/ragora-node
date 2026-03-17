@@ -106,6 +106,10 @@ export interface SearchResult {
   documentId?: string;
   /** Collection ID */
   collectionId?: string;
+  /** Page number in source document */
+  pageNumber?: number;
+  /** Section heading for the chunk */
+  sectionHeading?: string;
 }
 
 export interface SearchResponse extends ResponseMetadata {
